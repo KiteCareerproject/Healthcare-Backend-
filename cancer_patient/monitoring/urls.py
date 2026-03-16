@@ -21,6 +21,15 @@ urlpatterns = [
     path('translate/to-tamil/', views.translate_to_tamil_api, name='translate_to_tamil'),
     
     # Templates
-    path('voice/templates/', views.get_voice_templates, name='get_voice_templates'),
+    # path('voice/templates/', views.get_voice_templates, name='get_voice_templates'),
+
+    # Alert URLs
+    path('api/alerts/send/', views.send_alert_to_patient, name='send_alert'),
+    path('api/alerts/bulk-send/', views.send_bulk_alerts, name='bulk_send_alerts'),
+    path('api/alerts/patient/<str:patient_id>/', views.get_patient_alerts, name='patient_alerts'),
+    path('api/alerts/<str:alert_id>/read/', views.mark_alert_read, name='mark_alert_read'),
+    path('api/alerts/<str:alert_id>/acknowledge/', views.acknowledge_alert, name='acknowledge_alert'),
+    path('api/alerts/<str:alert_id>/delete/', views.delete_alert, name='delete_alert'),
+    # path('api/alerts/templates/', views.get_alert_templates, name='alert_templates')
 
 ]

@@ -33,6 +33,8 @@ from questionnaires.models import QuestionnaireAssignment
 from monitoring.models import Alert, DailyResponse 
 from monitoring.serializers import AlertSerializer
 
+from rest_framework.views import APIView
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -781,12 +783,12 @@ def get_nurse_patients(request, nurse_id):
     except NurseProfile.DoesNotExist:
         raise APIError("Nurse not found", status_code=status.HTTP_404_NOT_FOUND)
 
-    # 🔥 DJONGO SAFE QUERY (NO BOOLEAN, NO FK OBJECT)
+    #  DJONGO SAFE QUERY (NO BOOLEAN, NO FK OBJECT)
     assignments = PatientAssignment.objects.filter(
         nurse_id=nurse.nurse_id
     )
 
-    # 🔥 FILTER BOOLEAN IN PYTHON
+    #  FILTER BOOLEAN IN PYTHON
     active_assignments = [
         a for a in assignments if a.is_active
     ]
@@ -854,7 +856,7 @@ def get_dashboard_stats(request):
                 status='NEW'
             ).count()
             
-            # 🔴 FIX: Use datetime range instead of __date
+            #  FIX: Use datetime range instead of __date
             today_responses = DailyResponse.objects.filter(
                 response_date__gte=start_of_month,
                 response_date__lte=today
@@ -898,7 +900,7 @@ def get_dashboard_stats(request):
             status='COMPLETED'
         ).count()
         
-        # 🔴 FIX: Patient Activity - use manual calculation
+        #  FIX: Patient Activity - use manual calculation
         last_7_days = [today - timedelta(days=i) for i in range(6, -1, -1)]
         patient_activity = []
         for day in last_7_days:
@@ -1306,7 +1308,7 @@ def get_dashboard_stats_report(request):
         count=Count('medical_record_id')
     ).order_by('-count')[:5]
     
-    # 🔴 FIXED: Diagnosis timeline - Manual Python aggregation instead of ExtractYear
+    #  FIXED: Diagnosis timeline - Manual Python aggregation instead of ExtractYear
     diagnosis_records = PatientMedicalRecord.objects.filter(
         created_at__lte=end_datetime
     ).values('diagnosis_date', 'medical_record_id')
@@ -1564,15 +1566,15 @@ def get_treatment_outcomes(request):
         end_datetime = datetime.strptime(end_date, '%Y-%m-%d')
         queryset = queryset.filter(created_at__date__gte=start_datetime, created_at__date__lte=end_datetime)
     
-    # 🔴 FIXED: Use alert_id instead of id
+    #  FIXED: Use alert_id instead of id
     # Outcomes by status
     by_status = queryset.values('status').annotate(
-        count=Count('alert_id')  # 👈 Changed from 'id' to 'alert_id'
+        count=Count('alert_id')  #  Changed from 'id' to 'alert_id'
     ).order_by('status')
     
     # Outcomes by severity
     by_severity = queryset.values('alert_level').annotate(
-        total=Count('alert_id'),  # 👈 Changed from 'id' to 'alert_id'
+        total=Count('alert_id'),  #  Changed from 'id' to 'alert_id'
         resolved=Count('alert_id', filter=Q(status='RESOLVED')),
         active=Count('alert_id', filter=Q(status__in=['NEW', 'ACKNOWLEDGED', 'IN_PROGRESS'])),
         escalated=Count('alert_id', filter=Q(status='ESCALATED'))
@@ -1633,3 +1635,951 @@ def get_monthly_trend(start_date, end_date):
         }
         for item in trend
     ]
+
+# ================================
+from .serializers import (
+    PatientListSerializer, AlertSerializer, 
+    DashboardStatsSerializer, PatientTrendSerializer
+)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def nurse_dashboard_stats(request):
+    """Get dashboard statistics for logged-in nurse - FIXED for Djongo"""
+    user = request.user
+    
+    # Verify nurse
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied. Nurse only.", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # FIXED: Get patient IDs without using JOIN
+    # Method 1: Get all assignments and extract patient_ids in Python
+    assignments = PatientAssignment.objects.filter(
+        nurse_id=nurse.nurse_id  # Use nurse_id directly, not nurse object
+    )
+    
+    # Filter active ones in Python
+    patient_ids = []
+    for assignment in assignments:
+        if assignment.is_active:
+            patient_ids.append(assignment.patient_id)
+    
+    # If no patients, return zeros
+    if not patient_ids:
+        today = datetime.now()
+        greeting = get_greeting(today.hour)
+        
+        return Response({
+            'success': True,
+            'data': {
+                'welcome': {
+                    'message': f"{greeting}, {nurse.first_name}",
+                    'date': today.strftime('%A, %B %d, %Y')
+                },
+                'stats': {
+                    'total_patients': {'value': 0, 'label': 'Total Patients', 'icon': 'people', 'color': 'primary'},
+                    'critical': {'value': 0, 'label': 'Critical', 'icon': 'exclamation-triangle', 'color': 'danger'},
+                    'high_risk': {'value': 0, 'label': 'High Risk', 'icon': 'graph-up', 'color': 'warning'},
+                    'active_alerts': {'value': 0, 'label': 'Active Alerts', 'icon': 'bell', 'color': 'info'},
+                    'need_review': {'value': 0, 'label': 'Need Review', 'icon': 'clock-history', 'color': 'secondary'}
+                }
+            }
+        })
+    
+    # Calculate statistics manually to avoid complex queries
+    
+    # 1. Total patients
+    total_patients = len(patient_ids)
+    
+    # 2. Critical patients - based on alerts
+    critical_count = 0
+    critical_patient_ids = set()
+    
+    # Get all critical alerts for these patients
+    for patient_id in patient_ids:
+        try:
+            # Check for critical alerts
+            alerts = Alert.objects.filter(
+                patient_id=patient_id,
+                alert_level='CRITICAL'
+            )
+            
+            for alert in alerts:
+                if alert.status in ['NEW', 'ACKNOWLEDGED']:
+                    critical_patient_ids.add(patient_id)
+                    break
+        except Exception as e:
+            logger.error(f"Error checking critical alerts for patient {patient_id}: {str(e)}")
+    
+    critical_patients = len(critical_patient_ids)
+    
+    # 3. High risk patients - from medical records
+    high_risk_count = 0
+    
+    for patient_id in patient_ids:
+        try:
+            # Get medical record
+            medical_record = PatientMedicalRecord.objects.filter(
+                patient_id=patient_id
+            ).first()
+            
+            if medical_record and hasattr(medical_record, 'risk_level') and medical_record.risk_level == 'HIGH':
+                high_risk_count += 1
+        except Exception as e:
+            logger.error(f"Error checking risk level for patient {patient_id}: {str(e)}")
+    
+    # 4. Active alerts
+    active_alerts = 0
+    
+    for patient_id in patient_ids:
+        try:
+            alerts = Alert.objects.filter(
+                patient_id=patient_id,
+                status__in=['NEW', 'ACKNOWLEDGED']
+            )
+            active_alerts += len(list(alerts))  # Use len(list()) instead of count()
+        except Exception as e:
+            logger.error(f"Error counting alerts for patient {patient_id}: {str(e)}")
+    
+    # 5. Need review
+    need_review = 0
+    
+    for patient_id in patient_ids:
+        try:
+            # Check for pending questionnaires
+            pending = QuestionnaireAssignment.objects.filter(
+                patient_id=patient_id,
+                status='PENDING'
+            )
+            need_review += len(list(pending))  # Use len(list()) instead of count()
+        except Exception as e:
+            logger.error(f"Error checking pending questionnaires for patient {patient_id}: {str(e)}")
+    
+    # Today's date for welcome message
+    today = datetime.now()
+    greeting = get_greeting(today.hour)
+    
+    return Response({
+        'success': True,
+        'data': {
+            'welcome': {
+                'message': f"{greeting}, {nurse.first_name}",
+                'date': today.strftime('%A, %B %d, %Y')
+            },
+            'stats': {
+                'total_patients': {
+                    'value': total_patients,
+                    'label': 'Total Patients',
+                    'icon': 'people',
+                    'color': 'primary'
+                },
+                'critical': {
+                    'value': critical_patients,
+                    'label': 'Critical',
+                    'icon': 'exclamation-triangle',
+                    'color': 'danger'
+                },
+                'high_risk': {
+                    'value': high_risk_count,
+                    'label': 'High Risk',
+                    'icon': 'graph-up',
+                    'color': 'warning'
+                },
+                'active_alerts': {
+                    'value': active_alerts,
+                    'label': 'Active Alerts',
+                    'icon': 'bell',
+                    'color': 'info'
+                },
+                'need_review': {
+                    'value': need_review,
+                    'label': 'Need Review',
+                    'icon': 'clock-history',
+                    'color': 'secondary'
+                }
+            }
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def nurse_patients(request):
+    """Get list of patients assigned to nurse with filters - FIXED for Djongo"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Get query parameters for filtering
+    search = request.query_params.get('search', '')
+    status_filter = request.query_params.get('status', '')  # critical, high_risk, stable
+    alert_filter = request.query_params.get('alerts', '')  # has_alerts
+    
+    # FIXED: Get patient IDs without JOIN
+    assignments = PatientAssignment.objects.filter(
+        nurse_id=nurse.nurse_id
+    )
+    
+    # Filter active in Python
+    patient_ids = []
+    for assignment in assignments:
+        if assignment.is_active:
+            patient_ids.append(assignment.patient_id)
+    
+    if not patient_ids:
+        return Response({
+            'success': True,
+            'data': [],
+            'filters': {
+                'search': search,
+                'status': status_filter,
+                'alerts': alert_filter
+            }
+        })
+    
+    # Get patients
+    patient_data = []
+    
+    for patient_id in patient_ids:
+        try:
+            patient = PatientProfile.objects.filter(patient_id=patient_id).first()
+            if not patient:
+                continue
+            
+            # Get medical record
+            medical_record = PatientMedicalRecord.objects.filter(
+                patient_id=patient_id
+            ).first()
+            
+            # Get latest alert
+            alerts = Alert.objects.filter(
+                patient_id=patient_id
+            ).order_by('-created_at')
+            
+            latest_alert = None
+            for alert in alerts:
+                latest_alert = alert
+                break
+            
+            # Get pending questionnaires
+            pending = QuestionnaireAssignment.objects.filter(
+                patient_id=patient_id,
+                status='PENDING'
+            )
+            pending_count = len(list(pending))
+            
+            # Count alerts by level
+            critical_alerts = 0
+            warning_alerts = 0
+            
+            for alert in alerts:
+                if alert.status in ['NEW', 'ACKNOWLEDGED']:
+                    if alert.alert_level == 'CRITICAL':
+                        critical_alerts += 1
+                    elif alert.alert_level == 'HIGH':
+                        warning_alerts += 1
+            
+            # Determine status
+            if latest_alert and latest_alert.alert_level == 'CRITICAL' and latest_alert.status in ['NEW', 'ACKNOWLEDGED']:
+                status_badge = 'danger'
+                status_text = 'Critical'
+            elif medical_record and hasattr(medical_record, 'risk_level') and medical_record.risk_level == 'HIGH':
+                status_badge = 'warning'
+                status_text = 'High Risk'
+            else:
+                status_badge = 'success'
+                status_text = 'Stable'
+            
+            # Check if patient matches search
+            if search:
+                search_lower = search.lower()
+                name = f"{patient.first_name} {patient.last_name}".lower()
+                if search_lower not in name and search_lower not in str(patient_id):
+                    continue
+            
+            patient_data.append({
+                'id': patient.patient_id,
+                'name': f"{patient.first_name} {patient.last_name}",
+                'age': calculate_age(patient.date_of_birth) if patient.date_of_birth else 'N/A',
+                'gender': patient.gender,
+                'condition': medical_record.cancer_type.name if medical_record and hasattr(medical_record, 'cancer_type') and medical_record.cancer_type else 'N/A',
+                'status': {
+                    'badge': status_badge,
+                    'text': status_text
+                },
+                'last_activity': latest_alert.created_at if latest_alert else None,
+                'pending_review': pending_count,
+                'alerts': {
+                    'critical': critical_alerts,
+                    'warning': warning_alerts
+                }
+            })
+            
+        except Exception as e:
+            logger.error(f"Error processing patient {patient_id}: {str(e)}")
+            continue
+    
+    # Apply filters in Python
+    if status_filter == 'critical':
+        patient_data = [p for p in patient_data if p['status']['text'] == 'Critical']
+    elif status_filter == 'high_risk':
+        patient_data = [p for p in patient_data if p['status']['text'] == 'High Risk']
+    elif status_filter == 'stable':
+        patient_data = [p for p in patient_data if p['status']['text'] == 'Stable']
+    
+    if alert_filter == 'has_alerts':
+        patient_data = [p for p in patient_data if p['alerts']['critical'] > 0 or p['alerts']['warning'] > 0]
+    
+    return Response({
+        'success': True,
+        'data': patient_data,
+        'filters': {
+            'search': search,
+            'status': status_filter,
+            'alerts': alert_filter
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def nurse_response_history(request):
+    """Get response history for nurse's patients - FIXED for Djongo"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Get date range
+    days = int(request.query_params.get('days', 7))
+    end_date = timezone.now().date()
+    start_date = end_date - timedelta(days=days)
+    
+    # FIXED: Get patient IDs without using complex queries
+    # Get all assignments for this nurse
+    all_assignments = PatientAssignment.objects.filter(
+        nurse_id=nurse.nurse_id  # Use nurse_id directly
+    )
+    
+    # Filter active in Python
+    patient_ids = []
+    for assignment in all_assignments:
+        if assignment.is_active:
+            patient_ids.append(assignment.patient_id)
+    
+    # If no patients, return empty response
+    if not patient_ids:
+        return Response({
+            'success': True,
+            'data': {
+                'summary': {
+                    'total': 0,
+                    'completed': 0,
+                    'pending': 0,
+                    'completion_rate': 0
+                },
+                'history': []
+            }
+        })
+    
+    # FIXED: Get responses manually without using complex filters
+    # Convert dates to datetime for range comparison
+    start_datetime = datetime.combine(start_date, datetime.min.time())
+    end_datetime = datetime.combine(end_date, datetime.max.time())
+    
+    # Get all responses and filter in Python
+    all_responses = DailyResponse.objects.all()
+    
+    responses = []
+    for response in all_responses:
+        # Check if patient_id matches and date is in range
+        if (response.patient_id in patient_ids and 
+            response.response_date >= start_date and 
+            response.response_date <= end_date):
+            responses.append(response)
+    
+    # Sort by date (most recent first)
+    responses.sort(key=lambda x: x.response_date, reverse=True)
+    
+    # Group by date
+    history_by_date = {}
+    for response in responses:
+        date_str = response.response_date.strftime('%Y-%m-%d')
+        if date_str not in history_by_date:
+            history_by_date[date_str] = {
+                'date': date_str,
+                'total': 0,
+                'completed': 0,
+                'pending': 0,
+                'patients': []
+            }
+        
+        history_by_date[date_str]['total'] += 1
+        if response.is_completed:
+            history_by_date[date_str]['completed'] += 1
+        else:
+            history_by_date[date_str]['pending'] += 1
+        
+        # Get patient name
+        patient = PatientProfile.objects.filter(patient_id=response.patient_id).first()
+        patient_name = 'Unknown'
+        if patient:
+            patient_name = f"{patient.first_name} {patient.last_name}"
+        
+        history_by_date[date_str]['patients'].append({
+            'patient_id': response.patient_id,
+            'patient_name': patient_name,
+            'completed': response.is_completed,
+            'response_time': response.submitted_at if hasattr(response, 'submitted_at') and response.submitted_at else None,
+            'needs_review': getattr(response, 'needs_review', False)
+        })
+    
+    # Convert to list and sort by date
+    history_list = list(history_by_date.values())
+    history_list.sort(key=lambda x: x['date'], reverse=True)
+    
+    # Summary stats
+    total_responses = len(responses)
+    completed_responses = sum(1 for r in responses if r.is_completed)
+    pending_responses = total_responses - completed_responses
+    
+    return Response({
+        'success': True,
+        'data': {
+            'summary': {
+                'total': total_responses,
+                'completed': completed_responses,
+                'pending': pending_responses,
+                'completion_rate': round((completed_responses / total_responses * 100) if total_responses > 0 else 0, 1)
+            },
+            'history': history_list
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def nurse_patient_trends(request):
+    """Get patient trends and analytics - FIXED for Djongo"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Get parameters
+    patient_id = request.query_params.get('patient_id')
+    metric = request.query_params.get('metric', 'vitals')  # vitals, responses, alerts
+    days = int(request.query_params.get('days', 30))
+    
+    end_date = timezone.now().date()
+    start_date = end_date - timedelta(days=days)
+    
+    # FIXED: Get patient IDs without complex queries
+    all_assignments = PatientAssignment.objects.filter(
+        nurse_id=nurse.nurse_id  # Use nurse_id directly
+    )
+    
+    # Filter active in Python
+    assigned_patient_ids = []
+    for assignment in all_assignments:
+        if assignment.is_active:
+            assigned_patient_ids.append(assignment.patient_id)
+    
+    # If no patients, return empty response
+    if not assigned_patient_ids:
+        return Response({
+            'success': True,
+            'data': {
+                'metric': metric,
+                'period': f"{start_date} to {end_date}",
+                'trends': []
+            }
+        })
+    
+    # Filter by specific patient if provided
+    if patient_id:
+        patient_id_int = int(patient_id) if patient_id.isdigit() else patient_id
+        if patient_id_int not in assigned_patient_ids:
+            raise APIError("Patient not assigned to you", status_code=status.HTTP_403_FORBIDDEN)
+        patient_ids = [patient_id_int]
+    else:
+        patient_ids = assigned_patient_ids
+    
+    trends_data = []
+    
+    for pid in patient_ids:
+        # Get patient info
+        patient = None
+        try:
+            patient = PatientProfile.objects.filter(patient_id=pid).first()
+        except Exception as e:
+            logger.error(f"Error fetching patient {pid}: {str(e)}")
+        
+        patient_name = 'Unknown'
+        if patient:
+            patient_name = f"{patient.first_name} {patient.last_name}"
+        
+        patient_trend = {
+            'patient_id': pid,
+            'patient_name': patient_name,
+            'data': []
+        }
+        
+        if metric == 'vitals':
+            # FIXED: Get all vitals and filter in Python
+            try:
+                all_vitals = VitalSign.objects.all()
+                
+                for vital in all_vitals:
+                    # Check if patient matches
+                    if getattr(vital, 'patient_id', None) != pid:
+                        continue
+                    
+                    # Check date range
+                    vital_date = getattr(vital, 'recorded_at', None)
+                    if vital_date:
+                        if hasattr(vital_date, 'date'):
+                            vital_date = vital_date.date()
+                        
+                        if vital_date < start_date or vital_date > end_date:
+                            continue
+                    
+                    patient_trend['data'].append({
+                        'date': vital_date.strftime('%Y-%m-%d') if vital_date else None,
+                        'heart_rate': getattr(vital, 'heart_rate', None),
+                        'blood_pressure_systolic': getattr(vital, 'blood_pressure_systolic', None),
+                        'blood_pressure_diastolic': getattr(vital, 'blood_pressure_diastolic', None),
+                        'temperature': getattr(vital, 'temperature', None),
+                        'oxygen_saturation': getattr(vital, 'oxygen_saturation', None)
+                    })
+            except Exception as e:
+                logger.error(f"Error fetching vitals for patient {pid}: {str(e)}")
+            
+            # Sort by date
+            patient_trend['data'].sort(key=lambda x: x['date'] if x['date'] else '')
+        
+        elif metric == 'responses':
+            # FIXED: Get all responses and filter in Python
+            try:
+                all_responses = DailyResponse.objects.all()
+                
+                for response in all_responses:
+                    # Check if patient matches
+                    if getattr(response, 'patient_id', None) != pid:
+                        continue
+                    
+                    # Check date range
+                    response_date = getattr(response, 'response_date', None)
+                    if response_date:
+                        if response_date < start_date or response_date > end_date:
+                            continue
+                    
+                    patient_trend['data'].append({
+                        'date': response_date.strftime('%Y-%m-%d') if response_date else None,
+                        'completed': getattr(response, 'is_completed', False),
+                        'score': getattr(response, 'total_score', None),
+                        'needs_review': getattr(response, 'needs_review', False)
+                    })
+            except Exception as e:
+                logger.error(f"Error fetching responses for patient {pid}: {str(e)}")
+            
+            # Sort by date
+            patient_trend['data'].sort(key=lambda x: x['date'] if x['date'] else '')
+        
+        elif metric == 'alerts':
+            # FIXED: Get all alerts and filter in Python
+            try:
+                all_alerts = Alert.objects.all()
+                
+                for alert in all_alerts:
+                    # Check if patient matches
+                    if getattr(alert, 'patient_id', None) != pid:
+                        continue
+                    
+                    # Check date range
+                    alert_date = getattr(alert, 'created_at', None)
+                    if alert_date:
+                        if hasattr(alert_date, 'date'):
+                            alert_date = alert_date.date()
+                        
+                        if alert_date < start_date or alert_date > end_date:
+                            continue
+                    
+                    patient_trend['data'].append({
+                        'date': alert_date.strftime('%Y-%m-%d') if alert_date else None,
+                        'level': getattr(alert, 'alert_level', None),
+                        'status': getattr(alert, 'status', None),
+                        'type': getattr(alert, 'alert_type', 'GENERAL')
+                    })
+            except Exception as e:
+                logger.error(f"Error fetching alerts for patient {pid}: {str(e)}")
+            
+            # Sort by date
+            patient_trend['data'].sort(key=lambda x: x['date'] if x['date'] else '')
+        
+        # Only add if there's data
+        if patient_trend['data']:
+            trends_data.append(patient_trend)
+    
+    return Response({
+        'success': True,
+        'data': {
+            'metric': metric,
+            'period': f"{start_date} to {end_date}",
+            'trends': trends_data
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def nurse_alerts(request):
+    """Get alerts for nurse's patients - FIXED for Djongo"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Get filter parameters
+    status = request.query_params.get('status', 'active')  # active, resolved, all
+    level = request.query_params.get('level', '')  # CRITICAL, HIGH, MEDIUM, LOW
+    days = int(request.query_params.get('days', 7))
+    
+    # FIXED: Get patient IDs without complex queries
+    all_assignments = PatientAssignment.objects.filter(
+        nurse_id=nurse.nurse_id
+    )
+    
+    # Filter active in Python
+    patient_ids = []
+    for assignment in all_assignments:
+        if assignment.is_active:
+            patient_ids.append(assignment.patient_id)
+    
+    # If no patients, return empty response
+    if not patient_ids:
+        return Response({
+            'success': True,
+            'data': {
+                'summary': {
+                    'total': 0,
+                    'critical': 0,
+                    'high': 0,
+                    'medium': 0,
+                    'low': 0,
+                    'new': 0,
+                    'acknowledged': 0
+                },
+                'alerts': []
+            }
+        })
+    
+    # Calculate date range
+    end_date = timezone.now()
+    start_date = end_date - timedelta(days=days)
+    
+    # FIXED: Get all alerts and filter in Python
+    all_alerts = Alert.objects.all()
+    
+    filtered_alerts = []
+    for alert in all_alerts:
+        # Check if patient_id matches
+        if alert.patient_id not in patient_ids:
+            continue
+        
+        # Check date range
+        if alert.created_at < start_date or alert.created_at > end_date:
+            continue
+        
+        # Check status filter
+        if status == 'active' and alert.status not in ['NEW', 'ACKNOWLEDGED']:
+            continue
+        elif status == 'resolved' and alert.status != 'RESOLVED':
+            continue
+        
+        # Check level filter
+        if level and alert.alert_level != level:
+            continue
+        
+        filtered_alerts.append(alert)
+    
+    # Sort by most recent
+    filtered_alerts.sort(key=lambda x: x.created_at, reverse=True)
+    
+    # Prepare response data
+    alert_data = []
+    summary_counts = {
+        'total': len(filtered_alerts),
+        'critical': 0,
+        'high': 0,
+        'medium': 0,
+        'low': 0,
+        'new': 0,
+        'acknowledged': 0
+    }
+    
+    for alert in filtered_alerts:
+        # Update summary counts
+        if alert.alert_level == 'CRITICAL':
+            summary_counts['critical'] += 1
+        elif alert.alert_level == 'HIGH':
+            summary_counts['high'] += 1
+        elif alert.alert_level == 'MEDIUM':
+            summary_counts['medium'] += 1
+        elif alert.alert_level == 'LOW':
+            summary_counts['low'] += 1
+        
+        if alert.status == 'NEW':
+            summary_counts['new'] += 1
+        elif alert.status == 'ACKNOWLEDGED':
+            summary_counts['acknowledged'] += 1
+        
+        # Get patient name
+        patient = PatientProfile.objects.filter(patient_id=alert.patient_id).first()
+        patient_name = 'Unknown'
+        if patient:
+            patient_name = f"{patient.first_name} {patient.last_name}"
+        
+        alert_data.append({
+            'id': getattr(alert, 'alert_id', getattr(alert, 'id', None)),
+            'patient_id': alert.patient_id,
+            'patient_name': patient_name,
+            'level': alert.alert_level,
+            'type': getattr(alert, 'alert_type', 'GENERAL'),
+            'message': getattr(alert, 'message', ''),
+            'status': alert.status,
+            'created_at': alert.created_at,
+            'acknowledged_at': getattr(alert, 'acknowledged_at', None),
+            'resolved_at': getattr(alert, 'resolved_at', None)
+        })
+    
+    return Response({
+        'success': True,
+        'data': {
+            'summary': summary_counts,
+            'alerts': alert_data
+        }
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def acknowledge_alert(request, alert_id):
+    """Acknowledge an alert"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    try:
+        alert = Alert.objects.get(alert_id=alert_id)
+    except Alert.DoesNotExist:
+        raise APIError("Alert not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Verify patient is assigned to this nurse
+    assignment = PatientAssignment.objects.filter(
+        nurse=nurse,
+        patient_id=alert.patient_id,
+        is_active=True
+    ).first()
+    
+    if not assignment:
+        raise APIError("Patient not assigned to you", status_code=status.HTTP_403_FORBIDDEN)
+    
+    # Update alert
+    alert.status = 'ACKNOWLEDGED'
+    alert.acknowledged_by = nurse
+    alert.acknowledged_at = timezone.now()
+    alert.save()
+    
+    logger.info(f"Alert {alert_id} acknowledged by nurse {nurse.nurse_id}")
+    
+    return Response({
+        'success': True,
+        'message': 'Alert acknowledged successfully',
+        'data': {
+            'alert_id': alert.alert_id,
+            'status': alert.status,
+            'acknowledged_at': alert.acknowledged_at
+        }
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def resolve_alert(request, alert_id):
+    """Resolve an alert"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    try:
+        alert = Alert.objects.get(alert_id=alert_id)
+    except Alert.DoesNotExist:
+        raise APIError("Alert not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Verify patient is assigned to this nurse
+    assignment = PatientAssignment.objects.filter(
+        nurse=nurse,
+        patient_id=alert.patient_id,
+        is_active=True
+    ).first()
+    
+    if not assignment:
+        raise APIError("Patient not assigned to you", status_code=status.HTTP_403_FORBIDDEN)
+    
+    # Get resolution notes from request
+    resolution_notes = request.data.get('resolution_notes', '')
+    
+    # Update alert
+    alert.status = 'RESOLVED'
+    alert.resolved_by = nurse
+    alert.resolved_at = timezone.now()
+    alert.resolution_notes = resolution_notes
+    alert.save()
+    
+    logger.info(f"Alert {alert_id} resolved by nurse {nurse.nurse_id}")
+    
+    return Response({
+        'success': True,
+        'message': 'Alert resolved successfully',
+        'data': {
+            'alert_id': alert.alert_id,
+            'status': alert.status,
+            'resolved_at': alert.resolved_at,
+            'resolution_notes': alert.resolution_notes
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def search_patients(request):
+    """Search patients by name or condition"""
+    user = request.user
+    
+    if user.user_type != 'NURSE':
+        raise APIError("Access denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        nurse = NurseProfile.objects.get(user=user)
+    except NurseProfile.DoesNotExist:
+        raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    search_term = request.query_params.get('q', '')
+    if len(search_term) < 2:
+        return Response({
+            'success': True,
+            'data': []
+        })
+    
+    # Get assigned patients
+    assignments = PatientAssignment.objects.filter(
+        nurse=nurse,
+        is_active=True
+    ).select_related('patient')
+    
+    patient_ids = [a.patient.patient_id for a in assignments]
+    
+    # Search in patients
+    patients = PatientProfile.objects.filter(
+        patient_id__in=patient_ids
+    ).filter(
+        Q(first_name__icontains=search_term) |
+        Q(last_name__icontains=search_term) |
+        Q(patient_id__icontains=search_term)
+    )
+    
+    # Search in medical records for condition
+    medical_records = PatientMedicalRecord.objects.filter(
+        patient_id__in=patient_ids,
+        cancer_type__name__icontains=search_term
+    ).values_list('patient_id', flat=True)
+    
+    # Combine results
+    result_ids = set(patients.values_list('patient_id', flat=True)) | set(medical_records)
+    
+    final_patients = PatientProfile.objects.filter(patient_id__in=result_ids)
+    
+    # Format response
+    search_results = []
+    for patient in final_patients:
+        medical_record = PatientMedicalRecord.objects.filter(patient=patient).first()
+        search_results.append({
+            'id': patient.patient_id,
+            'name': f"{patient.first_name} {patient.last_name}",
+            'condition': medical_record.cancer_type.name if medical_record and medical_record.cancer_type else 'N/A',
+            'age': calculate_age(patient.date_of_birth) if patient.date_of_birth else 'N/A',
+            'gender': patient.gender
+        })
+    
+    return Response({
+        'success': True,
+        'data': search_results
+    })
+
+
+# ==================== HELPER FUNCTIONS ====================
+
+def get_greeting(hour):
+    """Return greeting based on hour of day"""
+    if hour < 12:
+        return "Good morning"
+    elif hour < 17:
+        return "Good afternoon"
+    else:
+        return "Good evening"
+
+
+def calculate_age(birth_date):
+    """Calculate age from birth date"""
+    if not birth_date:
+        return None
+    today = timezone.now().date()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))

@@ -37,4 +37,16 @@ urlpatterns = [
     # Bulk operations
     path('bulk/create-nurses/', views.bulk_create_nurses, name='bulk-create-nurses'),
     path('bulk/assign-patients/', views.bulk_assign_patients, name='bulk-assign-patients'),
+
+    
+    # Nurse Dashboard
+    path('nurse/dashboard/stats/', views.nurse_dashboard_stats, name='nurse_dashboard_stats'),
+    # path('nurse/patients/', views.nurse_patients, name='nurse_patients'),
+    path('nurse/response-history/', views.nurse_response_history, name='nurse_response_history'),
+    path('nurse/patient-trends/', views.nurse_patient_trends, name='nurse_patient_trends'),
+    path('nurse/alerts/', views.nurse_alerts, name='nurse_alerts'),
+    path('nurse/alerts/<int:alert_id>/acknowledge/', views.acknowledge_alert, name='acknowledge_alert'),
+    path('nurse/alerts/<int:alert_id>/resolve/', views.resolve_alert, name='resolve_alert'),
+    path('nurse/search-patients/', views.search_patients, name='search_patients'),
+
 ]

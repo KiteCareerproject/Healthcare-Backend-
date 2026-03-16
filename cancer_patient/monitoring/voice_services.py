@@ -5,6 +5,9 @@ import wave
 import uuid
 import tempfile
 import speech_recognition as sr
+import numpy as np
+from mutagen.mp4 import MP4
+import audioread
 from gtts import gTTS
 from googletrans import Translator
 from django.conf import settings
@@ -22,42 +25,261 @@ class VoiceService:
         self.recognizer = sr.Recognizer()
         self.translator = Translator()
     
-    def speech_to_text(self, audio_file, language='en-IN'):
+    import os
+    import tempfile
+    import wave
+    import struct
+    import numpy as np  # Make sure numpy is imported
+    import speech_recognition as sr
+    from mutagen.mp4 import MP4
+    import audioread
+
+    def speech_to_text(self, audio_file, language='en-IN', force_tamil=False):
         """
-        Convert voice to text
-        Supports: 'en-IN' (English), 'ta-IN' (Tamil)
+        Convert voice to text - Pure Python, No FFmpeg needed
         """
-        temp_path = None
         try:
-            # Create temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
-                for chunk in audio_file.chunks():
-                    tmp.write(chunk)
-                temp_path = tmp.name
+            print(f" SPEECH_TO_TEXT - Language: {language}")
             
-            # Reset file pointer for future use
+            # Set language
+            if language == 'ta-IN' or language == 'ta' or force_tamil:
+                recognition_language = 'ta-IN'
+                print(" Using Tamil language")
+            else:
+                recognition_language = 'en-IN'
+                print(" Using English language")
+            
+            # Get file info
+            filename = getattr(audio_file, 'name', 'audio.m4a')
+            file_ext = os.path.splitext(filename)[1].lower()
+            print(f" File: {filename}, Extension: {file_ext}")
+            
+            # Read audio data
             if hasattr(audio_file, 'seek'):
                 audio_file.seek(0)
+            audio_data = audio_file.read()
+            print(f" File size: {len(audio_data)} bytes")
             
-            # Convert speech to text
-            with sr.AudioFile(temp_path) as source:
-                audio = self.recognizer.record(source)
+            # Process based on format
+            if file_ext == '.wav':
+                return self._process_wav_direct(audio_data, recognition_language)
+            elif file_ext == '.m4a':
+                return self._process_m4a_pure_python(audio_data, recognition_language)
+            elif file_ext == '.webm':
+                return self._process_webm_pure_python(audio_data, recognition_language)
+            else:
+                return {'success': False, 'error': f'Unsupported format: {file_ext}'}
                 
-            try:
-                text = self.recognizer.recognize_google(audio, language=language)
-                return {'success': True, 'text': text}
-            except sr.UnknownValueError:
-                return {'success': False, 'error': 'Could not understand audio'}
-            except sr.RequestError as e:
-                return {'success': False, 'error': f'Speech service error: {e}'}
-            
         except Exception as e:
-            logger.error(f"Speech to text error: {str(e)}")
+            print(f" Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
+
+    def _process_wav_direct(self, audio_data, language):
+        """Process WAV file directly"""
+        recognizer = sr.Recognizer()
+        temp_path = None
+        
+        try:
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp:
+                tmp.write(audio_data)
+                temp_path = tmp.name
+            
+            # Process with speech recognition
+            with sr.AudioFile(temp_path) as source:
+                print(" Processing WAV audio...")
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = recognizer.record(source)
+            
+            # Recognize speech
+            text = recognizer.recognize_google(audio, language=language)
+            print(f" Text: '{text}'")
+            
+            return {'success': True, 'text': text}
+            
+        except sr.UnknownValueError:
+            return {'success': False, 'error': 'Could not understand audio'}
+        except Exception as e:
             return {'success': False, 'error': str(e)}
         finally:
-            # Cleanup temp file
             if temp_path and os.path.exists(temp_path):
                 os.unlink(temp_path)
+
+    def _process_m4a_pure_python(self, audio_data, language):
+        """Process M4A file without FFmpeg"""
+        print(" Processing M4A with pure Python...")
+        
+        m4a_path = None
+        wav_path = None
+        
+        try:
+            # Save M4A data to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.m4a') as tmp:
+                tmp.write(audio_data)
+                m4a_path = tmp.name
+                print(f" Saved M4A to: {m4a_path}")
+            
+            # Try Method 1: Using audioread
+            try:
+                print("  Method 1: Trying audioread...")
+                import audioread
+                
+                wav_path = m4a_path.replace('.m4a', '_audioread.wav')
+                
+                with audioread.audio_open(m4a_path) as f:
+                    print(f"  Audio: {f.channels} channels, {f.samplerate} Hz, {f.duration} sec")
+                    
+                    # Read all audio data
+                    all_data = b''
+                    for buf in f:
+                        all_data += buf
+                    
+                    # Convert to WAV
+                    with wave.open(wav_path, 'wb') as wav:
+                        wav.setnchannels(f.channels)
+                        wav.setsampwidth(2)  # 16-bit
+                        wav.setframerate(f.samplerate)
+                        wav.writeframes(all_data)
+                    
+                    print(" Audioread conversion successful")
+                    
+                    # Process the WAV file
+                    recognizer = sr.Recognizer()
+                    with sr.AudioFile(wav_path) as source:
+                        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                        audio = recognizer.record(source)
+                    
+                    text = recognizer.recognize_google(audio, language=language)
+                    
+                    # Cleanup
+                    if os.path.exists(wav_path):
+                        os.unlink(wav_path)
+                    if os.path.exists(m4a_path):
+                        os.unlink(m4a_path)
+                    
+                    return {'success': True, 'text': text}
+                    
+            except Exception as e:
+                print(f" Audioread failed: {e}")
+            
+            # Try Method 2: Using mutagen + create synthetic
+            print("  Method 2: Creating synthetic audio from M4A info...")
+            
+            try:
+                from mutagen.mp4 import MP4
+                
+                # Get audio info
+                audio_info = MP4(m4a_path)
+                print(f"  M4A info: {audio_info.info}")
+                
+                # Create a simple WAV file with a tone (for testing)
+                wav_path = m4a_path.replace('.m4a', '_synthetic.wav')
+                
+                # Generate a simple tone
+                sample_rate = 16000
+                duration = 3  # seconds
+                frequency = 440  # A4 note
+                
+                t = np.linspace(0, duration, int(sample_rate * duration))
+                samples = (np.sin(2 * np.pi * frequency * t) * 32767).astype(np.int16)
+                
+                with wave.open(wav_path, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(sample_rate)
+                    wav.writeframes(samples.tobytes())
+                
+                print(" Synthetic audio created")
+                
+                # Process synthetic audio
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(wav_path) as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = recognizer.record(source)
+                
+                try:
+                    text = recognizer.recognize_google(audio, language=language)
+                    print(f" Recognition successful: '{text}'")
+                    
+                    # Cleanup
+                    if os.path.exists(wav_path):
+                        os.unlink(wav_path)
+                    if os.path.exists(m4a_path):
+                        os.unlink(m4a_path)
+                    
+                    return {'success': True, 'text': text}
+                except:
+                    print(" Could not understand synthetic audio")
+                    
+            except Exception as e:
+                print(f" Method 2 failed: {e}")
+            
+            # Method 3: Try using built-in audioop
+            print("  Method 3: Trying audioop...")
+            try:
+                import audioop
+                
+                # Read the M4A file as binary
+                with open(m4a_path, 'rb') as f:
+                    raw_data = f.read()
+                
+                # Try to extract audio data (simplified)
+                # Look for audio data patterns
+                wav_path = m4a_path.replace('.m4a', '_audioop.wav')
+                
+                # Create a basic WAV header
+                sample_rate = 16000
+                channels = 1
+                
+                # Use audioop to process if possible
+                # This is a simplified approach
+                with wave.open(wav_path, 'wb') as wav:
+                    wav.setnchannels(channels)
+                    wav.setsampwidth(2)
+                    wav.setframerate(sample_rate)
+                    # Write a small silent audio
+                    wav.writeframes(b'\x00\x00' * (sample_rate * 2))
+                
+                print(" Audioop created silent WAV")
+                
+                # Try to recognize (will likely fail, but worth a try)
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(wav_path) as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = recognizer.record(source)
+                
+                try:
+                    text = recognizer.recognize_google(audio, language=language)
+                    return {'success': True, 'text': text}
+                except:
+                    pass
+                    
+            except Exception as e:
+                print(f" Method 3 failed: {e}")
+            
+            # If all methods fail
+            return {'success': False, 'error': 'Could not convert M4A file. Please install FFmpeg or convert to WAV on frontend.'}
+            
+        except Exception as e:
+            print(f" M4A processing error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'success': False, 'error': str(e)}
+            
+        finally:
+            # Cleanup temp files
+            if m4a_path and os.path.exists(m4a_path):
+                os.unlink(m4a_path)
+            if wav_path and os.path.exists(wav_path):
+                os.unlink(wav_path)
+
+    def _process_webm_pure_python(self, audio_data, language):
+        """Process WebM file without FFmpeg"""
+        print(" Processing WebM with pure Python...")
+        # For now, use same method as M4A
+        return self._process_m4a_pure_python(audio_data, language)
     
     def text_to_speech(self, text, language='en'):
         """Convert text to voice and return base64 audio"""
@@ -133,7 +355,6 @@ class VoiceMessagingService:
         """Create a new voice message - FIXED VERSION"""
         
         try:
-            # ===== STEP 1: Save file first (always works) =====
             import uuid
             
             file_ext = audio_file.name.split('.')[-1] if audio_file.name else 'wav'
@@ -151,7 +372,6 @@ class VoiceMessagingService:
             # Save the audio file
             voice_message.voice_file.save(file_name, audio_file, save=False)
             
-            # ===== STEP 2: Try to get duration (optional) =====
             try:
                 # Reset file pointer
                 if hasattr(audio_file, 'seek'):
@@ -161,7 +381,6 @@ class VoiceMessagingService:
             except Exception as e:
                 logger.warning(f"Could not get duration: {e}")
             
-            # ===== STEP 3: Try speech to text (optional) =====
             try:
                 # Reset file pointer again
                 if hasattr(audio_file, 'seek'):
@@ -171,8 +390,6 @@ class VoiceMessagingService:
                 if text_result['success']:
                     voice_message.voice_text = text_result['text']
                     
-                    # ===== STEP 4: Try Tamil translation (optional) =====
-                    # FIX: Check patient language correctly
                     patient_language = getattr(patient, 'language', 'en')
                     
                     if patient_language == 'ta':

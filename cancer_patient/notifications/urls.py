@@ -7,4 +7,7 @@ urlpatterns = [
     path('read-all/', views.mark_all_read, name='mark_all_read'),
     path('create/', views.create_notification, name='create_notification'),
     path('reminders/', views.get_reminder_schedules, name='reminder_schedules'),
+
+    path('preferences/', views.notification_preferences, name='notification_preferences'),
+    path('<int:notification_id>/delete/', views.delete_notification, name='delete_notification'),
 ]

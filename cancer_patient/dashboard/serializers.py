@@ -4,9 +4,12 @@ from accounts.serializers import NurseProfileSerializer, DoctorProfileSerializer
 from patients.serializers import PatientMedicalRecordSerializer
 
 from accounts.models import User, NurseProfile, DoctorProfile, AdminProfile, PatientProfile
-from patients.models import PatientMedicalRecord
+from patients.models import PatientMedicalRecord, PatientProfile
 from django.contrib.auth.hashers import make_password
 from django.db import transaction
+from datetime import datetime, timedelta
+from django.utils import timezone
+from monitoring.models import Alert
 
 class UserSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(read_only=True)
@@ -843,3 +846,54 @@ class AnalyticsReportSerializer(serializers.ModelSerializer):
     class Meta:
         model = AnalyticsReport
         fields = '__all__'
+
+
+
+class PatientListSerializer(serializers.ModelSerializer):
+    name = serializers.SerializerMethodField()
+    age = serializers.SerializerMethodField()
+    condition = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = PatientProfile
+        fields = ['patient_id', 'name', 'age', 'gender', 'condition']
+    
+    def get_name(self, obj):
+        return f"{obj.first_name} {obj.last_name}"
+    
+    def get_age(self, obj):
+        if obj.date_of_birth:
+            today = timezone.now().date()
+            return today.year - obj.date_of_birth.year
+        return None
+    
+    def get_condition(self, obj):
+        medical_record = obj.medical_records.first()
+        if medical_record and medical_record.cancer_type:
+            return medical_record.cancer_type.name
+        return 'N/A'
+
+class AlertSerializer(serializers.ModelSerializer):
+    patient_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = Alert
+        fields = '__all__'
+    
+    def get_patient_name(self, obj):
+        patient = PatientProfile.objects.filter(patient_id=obj.patient_id).first()
+        if patient:
+            return f"{patient.first_name} {patient.last_name}"
+        return 'Unknown'
+
+class DashboardStatsSerializer(serializers.Serializer):
+    total_patients = serializers.IntegerField()
+    critical = serializers.IntegerField()
+    high_risk = serializers.IntegerField()
+    active_alerts = serializers.IntegerField()
+    need_review = serializers.IntegerField()
+
+class PatientTrendSerializer(serializers.Serializer):
+    patient_id = serializers.IntegerField()
+    patient_name = serializers.CharField()
+    data = serializers.ListField()

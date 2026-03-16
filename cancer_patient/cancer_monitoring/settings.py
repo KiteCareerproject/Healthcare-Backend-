@@ -25,7 +25,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-your-secret-key-here')
 
 DEBUG = True
 
-ALLOWED_HOSTS = ['192.168.1.18', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['192.168.1.4', 'localhost', '127.0.0.1']
 
 # Application definition
 INSTALLED_APPS = [
@@ -41,7 +41,8 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'corsheaders',
     'drf_yasg',
-    
+    'channels',
+
     # Local apps
     'accounts',
     'patients',
@@ -166,3 +167,17 @@ AUTH_USER_MODEL = 'accounts.User'
 
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+ASGI_APPLICATION = 'cancer_monitoring.asgi.application'
+
+# Channel layers (use Redis in production)
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer'  # For development
+        # For production with Redis:
+        # 'BACKEND': 'channels_redis.core.RedisChannelLayer',
+        # 'CONFIG': {
+        #     "hosts": [('127.0.0.1', 6379)],
+        # },
+    }
+}

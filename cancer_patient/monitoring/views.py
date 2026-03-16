@@ -775,88 +775,91 @@ import io
 import imageio_ffmpeg
 from pydub import AudioSegment
 from django.core.files.uploadedfile import InMemoryUploadedFile
+from deep_translator import GoogleTranslator  
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def voice_to_text_api(request):
-    """Convert uploaded voice to text - FIXED with MP3 Support"""
+    """Convert voice to text with optional translation"""
     
     # Debug
     print("=== VOICE TO TEXT DEBUG ===")
     print("FILES keys:", list(request.FILES.keys()))
     print("POST keys:", list(request.POST.keys()))
-    print("Data keys:", list(request.data.keys()) if isinstance(request.data, dict) else [])
-    print("===========================")
     
-    # ===== FIX: Try multiple field names =====
+    # Get audio file
     audio_file = None
-    
-    # Check all possible keys in FILES
     for key in request.FILES.keys():
-        clean_key = key.strip().replace('"', '').replace(' ', '').lower()
-        if 'audio' in clean_key or 'file' in clean_key or 'voice' in clean_key or 'sound' in clean_key:
+        if 'audio' in key.lower() or 'file' in key.lower():
             audio_file = request.FILES.get(key)
-            print(f"Found audio file with key: {key}")
             break
     
-    # Get language
-    language = 'en-IN'  # Default
-    # ... (your existing language code)
-    
     if not audio_file:
-        return Response({
-            'success': False,
-            'error': 'Audio file required',
-            'debug': {
-                'received_files': list(request.FILES.keys()),
-                'hint': 'Send with key "Audio file" in form-data'
-            }
-        }, status=400)
+        return Response({'success': False, 'error': 'Audio file required'}, status=400)
     
-    # ===== MP3 to WAV Conversion with imageio-ffmpeg =====
-    file_name = audio_file.name.lower()
-    file_content = audio_file.read()
+    # ===== GET PARAMETERS =====
+    # Source language (what language is spoken in audio)
+    source_lang = request.POST.get('source_language') or 'ta-IN'  # Default: Tamil
     
-    if file_name.endswith('.mp3'):
-        print(f"Converting MP3 to WAV: {audio_file.name}")
-        
+    # Target language (what language output should be)
+    target_lang = request.POST.get('target_language') or 'en-IN'  # Default: English
+    
+    # Whether to translate
+    translate = request.POST.get('translate', 'true').lower() == 'true'
+    
+    print(f" Source: {source_lang}, Target: {target_lang}, Translate: {translate}")
+    
+    # ===== STEP 1: Speech to Text in SOURCE language =====
+    # Extract source language code (ta-IN -> ta, en-IN -> en)
+    source_code = source_lang.split('-')[0] if '-' in source_lang else source_lang
+    
+    # Call your STT with source language
+    stt_result = voice_service.speech_to_text(audio_file, language=source_lang)
+    
+    if not stt_result.get('success'):
+        return Response(stt_result)
+    
+    transcribed_text = stt_result['text']
+    print(f" Transcribed ({source_code}): {transcribed_text}")
+    
+    # ===== STEP 2: Translate if needed =====
+    if translate and source_code != target_lang.split('-')[0]:
         try:
-            # Get FFmpeg path from imageio-ffmpeg
-            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-            AudioSegment.converter = ffmpeg_path
-            AudioSegment.ffprobe = ffmpeg_path.replace('ffmpeg.exe', 'ffprobe.exe')
+            # Extract target language code
+            target_code = target_lang.split('-')[0] if '-' in target_lang else target_lang
             
-            # Convert
-            audio = AudioSegment.from_mp3(io.BytesIO(file_content))
+            # Translate
+            translator = GoogleTranslator(source=source_code, target=target_code)
+            translated_text = translator.translate(transcribed_text)
             
-            wav_io = io.BytesIO()
-            audio.export(wav_io, format='wav')
-            wav_io.seek(0)
+            print(f" Translated ({source_code}→{target_code}): {translated_text}")
             
-            # Create new file
-            audio_file = InMemoryUploadedFile(
-                wav_io,
-                'audio_file',
-                audio_file.name.replace('.mp3', '.wav'),
-                'audio/wav',
-                wav_io.getbuffer().nbytes,
-                None
-            )
-            print("MP3 to WAV conversion successful!")
-            
-        except Exception as e:
-            print(f"Error converting MP3: {str(e)}")
             return Response({
-                'success': False,
-                'error': 'MP3 conversion failed',
-                'debug': {
-                    'solution': 'Install FFmpeg: winget install ffmpeg'
-                }
-            }, status=400)
-    
-    # Convert speech to text
-    result = voice_service.speech_to_text(audio_file, language)
-    return Response(result)
+                'success': True,
+                'original_text': transcribed_text,
+                'original_language': source_lang,
+                'text': translated_text,
+                'language': target_lang,
+                'translated': True
+            })
+        except Exception as e:
+            print(f"Translation error: {e}")
+            # Fallback to original text
+            return Response({
+                'success': True,
+                'text': transcribed_text,
+                'language': source_lang,
+                'translated': False,
+                'error': f'Translation failed: {e}'
+            })
+    else:
+        # No translation needed
+        return Response({
+            'success': True,
+            'text': transcribed_text,
+            'language': source_lang,
+            'translated': False
+        })
 
 
 
@@ -1049,3 +1052,567 @@ def get_voice_templates(request):
                 'success': False,
                 'error': f'Database error: {str(e2)}'
             }, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def send_alert_to_patient(request):
+    """Send an alert to a specific patient"""
+    
+    # Only nurses, doctors, and admins can send alerts
+    if request.user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
+        return Response({
+            'success': False,
+            'error': 'Permission denied. Only nurses, doctors, and admins can send alerts.'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Debug
+    print("=== SEND ALERT DEBUG ===")
+    print("Content-Type:", request.content_type)
+    print("Data:", request.data)
+    print("POST:", request.POST)
+    print("========================")
+    
+    # ===== FIX: Extract data with flexible field names =====
+    
+    # Patient ID - try multiple field names
+    patient_id = None
+    possible_patient_keys = [
+        'patient_id', 'patientId', 'patient', 'PatientID', 
+        'patient-id', 'pid', 'patientid', 'patientID'
+    ]
+    
+    if isinstance(request.data, dict):
+        for key in possible_patient_keys:
+            if key in request.data:
+                patient_id = request.data[key]
+                print(f"Found patient_id with key: {key}")
+                break
+    
+    if not patient_id and request.POST:
+        for key in request.POST.keys():
+            clean_key = key.strip().replace('"', '').lower().replace('-', '').replace('_', '')
+            if clean_key in ['patientid', 'patient', 'pid']:
+                patient_id = request.POST.get(key)
+                print(f"Found patient_id in POST with key: {key}")
+                break
+    
+    # Alert type
+    alert_type = 'GENERAL'
+    possible_type_keys = ['alert_type', 'type', 'alertType', 'category']
+    
+    if isinstance(request.data, dict):
+        for key in possible_type_keys:
+            if key in request.data:
+                val = request.data[key]
+                # Validate against allowed types
+                allowed_types = ['QUESTIONNAIRE', 'MEDICATION', 'APPOINTMENT', 'SYMPTOM', 'GENERAL']
+                if val in allowed_types:
+                    alert_type = val
+                break
+    
+    # Priority
+    priority = 'MEDIUM'
+    possible_priority_keys = ['priority', 'level', 'severity', 'urgent']
+    
+    if isinstance(request.data, dict):
+        for key in possible_priority_keys:
+            if key in request.data:
+                val = request.data[key]
+                allowed_priorities = ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
+                if val in allowed_priorities:
+                    priority = val
+                break
+    
+    # Title
+    title = None
+    possible_title_keys = ['title', 'subject', 'heading', 'Title', 'TITLE']
+    
+    if isinstance(request.data, dict):
+        for key in possible_title_keys:
+            if key in request.data:
+                title = request.data[key]
+                print(f"Found title with key: {key}")
+                break
+    
+    if not title and request.POST:
+        for key in request.POST.keys():
+            clean_key = key.strip().replace('"', '').lower()
+            if clean_key in ['title', 'subject', 'heading']:
+                title = request.POST.get(key)
+                print(f"Found title in POST with key: {key}")
+                break
+    
+    # Message
+    message = None
+    possible_message_keys = ['message', 'msg', 'content', 'text', 'body', 'description']
+    
+    if isinstance(request.data, dict):
+        for key in possible_message_keys:
+            if key in request.data:
+                message = request.data[key]
+                print(f"Found message with key: {key}")
+                break
+    
+    if not message and request.POST:
+        for key in request.POST.keys():
+            clean_key = key.strip().replace('"', '').lower()
+            if clean_key in ['message', 'msg', 'content', 'text', 'body']:
+                message = request.POST.get(key)
+                print(f"Found message in POST with key: {key}")
+                break
+    
+    # Send via (delivery channels)
+    send_via = ['IN_APP']
+    if isinstance(request.data, dict) and 'send_via' in request.data:
+        send_via = request.data['send_via']
+    
+    # Assignment ID (optional)
+    assignment_id = None
+    if isinstance(request.data, dict):
+        for key in ['assignment_id', 'assignment', 'assignmentId']:
+            if key in request.data:
+                assignment_id = request.data[key]
+                break
+    
+    # Validate required fields
+    if not patient_id:
+        return Response({
+            'success': False,
+            'error': 'Patient ID is required',
+            'debug': {
+                'received_data': dict(request.data) if isinstance(request.data, dict) else str(request.data),
+                'received_post': dict(request.POST) if request.POST else {}
+            }
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not title:
+        return Response({
+            'success': False,
+            'error': 'Alert title is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not message:
+        return Response({
+            'success': False,
+            'error': 'Alert message is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Get patient medical record
+    try:
+        # Try to find by medical_record_id
+        patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
+        
+        if not patient_medical:
+            # Try by patient profile ID
+            patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
+            if patient_profile:
+                patient_medical = PatientMedicalRecord.objects.filter(patient=patient_profile).first()
+        
+        if not patient_medical:
+            # Try by user ID
+            if patient_id.isdigit():
+                try:
+                    from accounts.models import User
+                    user = User.objects.get(id=int(patient_id))
+                    if user.user_type == 'PATIENT':
+                        patient_profile = PatientProfile.objects.get(user=user)
+                        patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+                except:
+                    pass
+        
+        if not patient_medical:
+            return Response({
+                'success': False,
+                'error': f'Patient with ID {patient_id} not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+            
+    except Exception as e:
+        logger.error(f"Error finding patient: {str(e)}")
+        return Response({
+            'success': False,
+            'error': f'Error finding patient: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    # Get assignment if provided
+    assignment = None
+    if assignment_id:
+        try:
+            assignment = QuestionnaireAssignment.objects.get(assignment_id=assignment_id)
+        except QuestionnaireAssignment.DoesNotExist:
+            logger.warning(f"Assignment {assignment_id} not found")
+    
+    # Create the alert
+    try:
+        alert = Alert.objects.create(
+            patient=patient_medical,
+            alert_type=alert_type,
+            priority=priority,
+            title=title,
+            message=message,
+            assignment=assignment,
+            status='PENDING',
+            created_by=request.user
+        )
+        
+        # Add to recipients
+        AlertRecipient.objects.create(
+            alert=alert,
+            patient=patient_medical,
+            user=patient_medical.patient.user if patient_medical.patient.user else None,
+            status='PENDING'
+        )
+        
+        # Log the action
+        logger.info(f"Alert {alert.alert_id} created for patient {patient_id} by {request.user.username}")
+        
+        # TODO: Actually send the alert via selected channels
+        # This would integrate with SMS/Email/Push notification services
+        if 'SMS' in send_via:
+            # Send SMS logic here
+            pass
+        
+        if 'EMAIL' in send_via:
+            # Send Email logic here
+            pass
+        
+        if 'PUSH' in send_via:
+            # Send Push notification logic here
+            pass
+        
+        # Update status to SENT if any channel was used
+        if send_via != ['IN_APP']:
+            alert.status = 'SENT'
+            alert.sent_at = timezone.now()
+            alert.sent_via = send_via
+            alert.save()
+            
+            # Update recipient
+            recipient = alert.recipients.first()
+            if recipient:
+                recipient.status = 'SENT'
+                recipient.sent_at = timezone.now()
+                recipient.save()
+        
+        # Return success response
+        from .serializers import AlertSerializer
+        serializer = AlertSerializer(alert, context={'request': request})
+        
+        return Response({
+            'success': True,
+            'message': f'Alert sent to patient successfully',
+            'data': serializer.data
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        logger.error(f"Error creating alert: {str(e)}")
+        return Response({
+            'success': False,
+            'error': f'Failed to create alert: {str(e)}'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def send_bulk_alerts(request):
+    """Send alerts to multiple patients at once"""
+    
+    if request.user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
+        return Response({
+            'success': False,
+            'error': 'Permission denied'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Get data
+    patient_ids = request.data.get('patient_ids', [])
+    title = request.data.get('title')
+    message = request.data.get('message')
+    alert_type = request.data.get('alert_type', 'GENERAL')
+    priority = request.data.get('priority', 'MEDIUM')
+    
+    if not patient_ids or not isinstance(patient_ids, list):
+        return Response({
+            'success': False,
+            'error': 'List of patient IDs is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    if not title or not message:
+        return Response({
+            'success': False,
+            'error': 'Title and message are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Track results
+    successful = []
+    failed = []
+    
+    for patient_id in patient_ids:
+        try:
+            # Find patient
+            patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
+            
+            if not patient_medical:
+                patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
+                if patient_profile:
+                    patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+            
+            if not patient_medical:
+                failed.append({'id': patient_id, 'reason': 'Patient not found'})
+                continue
+            
+            # Create alert
+            alert = Alert.objects.create(
+                patient=patient_medical,
+                alert_type=alert_type,
+                priority=priority,
+                title=title,
+                message=message,
+                status='SENT',
+                sent_at=timezone.now(),
+                sent_via=['IN_APP'],
+                created_by=request.user
+            )
+            
+            # Add recipient
+            AlertRecipient.objects.create(
+                alert=alert,
+                patient=patient_medical,
+                user=patient_medical.patient.user if patient_medical.patient.user else None,
+                status='SENT',
+                sent_at=timezone.now()
+            )
+            
+            successful.append(patient_id)
+            
+        except Exception as e:
+            failed.append({'id': patient_id, 'reason': str(e)})
+    
+    logger.info(f"Bulk alerts sent by {request.user.username}: {len(successful)} successful, {len(failed)} failed")
+    
+    return Response({
+        'success': True,
+        'message': f'Alerts sent to {len(successful)} patients',
+        'data': {
+            'successful': successful,
+            'failed': failed
+        }
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_patient_alerts(request, patient_id):
+    """Get all alerts for a specific patient"""
+    
+    user = request.user
+    
+    # Check permission
+    if user.user_type == 'PATIENT':
+        # Patient can only see their own alerts
+        try:
+            patient_profile = PatientProfile.objects.get(user=user)
+            if patient_profile.patient_id != patient_id:
+                return Response({
+                    'success': False,
+                    'error': 'You can only view your own alerts'
+                }, status=status.HTTP_403_FORBIDDEN)
+        except PatientProfile.DoesNotExist:
+            return Response({
+                'success': False,
+                'error': 'Patient profile not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+    
+    elif user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
+        return Response({
+            'success': False,
+            'error': 'Permission denied'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Find patient
+    try:
+        patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
+        
+        if not patient_medical:
+            patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
+            if patient_profile:
+                patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+        
+        if not patient_medical:
+            return Response({
+                'success': False,
+                'error': 'Patient not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+    except Exception as e:
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    # Get alerts
+    alerts = Alert.objects.filter(patient=patient_medical).order_by('-created_at')
+    
+    # Optional filters
+    status_filter = request.GET.get('status')
+    if status_filter:
+        alerts = alerts.filter(status=status_filter)
+    
+    alert_type_filter = request.GET.get('type')
+    if alert_type_filter:
+        alerts = alerts.filter(alert_type=alert_type_filter)
+    
+    # If patient is viewing, mark as read automatically
+    if user.user_type == 'PATIENT':
+        for alert in alerts.filter(status='SENT'):
+            # Mark as delivered/read
+            alert.status = 'DELIVERED'
+            alert.delivered_at = timezone.now()
+            alert.save()
+            
+            recipient = alert.recipients.first()
+            if recipient:
+                recipient.status = 'DELIVERED'
+                recipient.delivered_at = timezone.now()
+                recipient.save()
+    
+    from .serializers import AlertSerializer
+    serializer = AlertSerializer(alerts, many=True, context={'request': request})
+    
+    return Response({
+        'success': True,
+        'data': serializer.data,
+        'total': alerts.count(),
+        'unread': alerts.filter(status='SENT').count()
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def mark_alert_read(request, alert_id):
+    """Mark an alert as read by patient"""
+    
+    user = request.user
+    
+    try:
+        alert = Alert.objects.get(alert_id=alert_id)
+    except Alert.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Alert not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+    
+    # Check permission
+    if user.user_type == 'PATIENT':
+        # Check if this alert belongs to this patient
+        try:
+            patient_profile = PatientProfile.objects.get(user=user)
+            if alert.patient.patient.patient_id != patient_profile.patient_id:
+                return Response({
+                    'success': False,
+                    'error': 'This alert does not belong to you'
+                }, status=status.HTTP_403_FORBIDDEN)
+        except:
+            return Response({
+                'success': False,
+                'error': 'Patient profile not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+    
+    # Mark as read
+    alert.status = 'READ'
+    alert.read_at = timezone.now()
+    alert.save()
+    
+    # Update recipient
+    recipient = alert.recipients.first()
+    if recipient:
+        recipient.status = 'READ'
+        recipient.read_at = timezone.now()
+        recipient.save()
+    
+    return Response({
+        'success': True,
+        'message': 'Alert marked as read'
+    })
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_alert(request, alert_id):
+    """Delete an alert (admin only)"""
+    
+    if request.user.user_type != 'ADMIN':
+        return Response({
+            'success': False,
+            'error': 'Only admins can delete alerts'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    try:
+        alert = Alert.objects.get(alert_id=alert_id)
+        alert.delete()
+        
+        logger.info(f"Alert {alert_id} deleted by admin {request.user.username}")
+        
+        return Response({
+            'success': True,
+            'message': 'Alert deleted successfully'
+        })
+        
+    except Alert.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Alert not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_alert_templates(request):
+    """Get predefined alert templates"""
+    
+    templates = [
+        {
+            'id': 'medication_reminder',
+            'name': 'Medication Reminder',
+            'type': 'MEDICATION',
+            'priority': 'HIGH',
+            'title': 'Time for Medication',
+            'message': 'This is a reminder to take your medication as prescribed.'
+        },
+        {
+            'id': 'appointment_reminder',
+            'name': 'Appointment Reminder',
+            'type': 'APPOINTMENT',
+            'priority': 'MEDIUM',
+            'title': 'Upcoming Appointment',
+            'message': 'You have an appointment scheduled. Please be on time.'
+        },
+        {
+            'id': 'questionnaire_reminder',
+            'name': 'Questionnaire Reminder',
+            'type': 'QUESTIONNAIRE',
+            'priority': 'MEDIUM',
+            'title': 'Daily Questionnaire',
+            'message': 'Please complete your daily health questionnaire.'
+        },
+        {
+            'id': 'symptom_alert',
+            'name': 'Symptom Alert',
+            'type': 'SYMPTOM',
+            'priority': 'URGENT',
+            'title': 'Urgent: Report Symptoms',
+            'message': 'Please report any new or worsening symptoms immediately.'
+        },
+        {
+            'id': 'general_notice',
+            'name': 'General Notice',
+            'type': 'GENERAL',
+            'priority': 'LOW',
+            'title': 'Important Notice',
+            'message': 'Please check the app for important updates.'
+        }
+    ]
+    
+    return Response({
+        'success': True,
+        'data': templates
+    })

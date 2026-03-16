@@ -27,3 +27,14 @@ soundfile==0.12.1
 sounddevice==0.4.6
 
 ffmpeg
+
+# word convert 
+python-docx==1.1.0
+
+channels channels-redis daphne
+
+pydub speechrecognition ffmpeg-python
+
+scipy
+
+mutagen
