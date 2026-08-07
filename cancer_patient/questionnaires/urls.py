@@ -6,7 +6,10 @@ urlpatterns = [
     path('questions/<int:question_id>/', views.question_detail, name='question_detail'),
     path('categories/', views.get_categories, name='categories'),
     path('assignments/', views.create_assignment, name='create_assignment'),
+    path('assignments/<int:assignment_id>/', views.update_assignment, name='update-assignment'),
     path('assignments/patient/<int:patient_id>/', views.get_patient_assignments, name='patient_assignments'),
+    path('assignments/patients/<int:patient_id>/', views.assignment_detail, name='patient_assignments'),
+    path('assignments/patients/<int:patient_id>/delete-all/', views.delete_all_assignments, name='delete_all_assignments'),
 
     # Patient submission endpoints
     path('patient/questionnaire/submit/',views.submit_questionnaire_responses, name='submit_questionnaire'),
@@ -20,11 +23,4 @@ urlpatterns = [
     # Admin notifications
     path('api/admin/notifications/', views.get_admin_notifications, name='admin-notifications'),
     
-    # Export to Excel
-    # path('api/admin/export-responses/', views.export_responses_to_excel, name='export-responses'),
-
-    # Report generation URLs
-    # path('reports/patient/<str:patient_id>/', views.generate_patient_report, name='patient_report'),
-    # path('reports/assignment/<int:assignment_id>/', views.generate_assignment_report, name='assignment_report'),
-    # path('patients/<str:patient_id>/summary/', views.get_patient_response_summary, name='patient_summary'),
 ]

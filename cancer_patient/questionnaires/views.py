@@ -9,6 +9,7 @@ from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
+from .utils import verify_admin
 import os
 from datetime import datetime
 from .models import QuestionCategory, Question, QuestionnaireAssignment, AssignedQuestion
@@ -19,7 +20,7 @@ from accounts.utils import handle_errors, APIError
 from .serializers import (
     QuestionCategorySerializer, QuestionSerializer,
     QuestionnaireAssignmentSerializer, CreateQuestionSerializer,
-    CreateAssignmentSerializer
+    CreateAssignmentSerializer, UpdateAssignmentSerializer
 )
 import logging
 
@@ -188,14 +189,21 @@ def create_assignment(request):
         raise APIError("Patient not found", status_code=status.HTTP_404_NOT_FOUND)
     
     # STEP 2: Get or create the medical record for this patient
+    # ✅ Fix: Handle multiple medical records
     try:
-        # Try to get existing medical record
-        patient_medical_record = PatientMedicalRecord.objects.get(patient=patient_profile)
+        # Get the latest medical record (most recent)
+        patient_medical_record = PatientMedicalRecord.objects.filter(
+            patient=patient_profile
+        ).latest('created_at')  # Get the most recent record
+        
+        logger.info(f"Using latest medical record {patient_medical_record.medical_record_id} for patient {data['patient_id']}")
+        
     except PatientMedicalRecord.DoesNotExist:
+        # Create new medical record if none exists
         patient_medical_record = PatientMedicalRecord.objects.create(
             patient=patient_profile,
         )
-        logger.info(f"Created medical record for patient {data['patient_id']}")
+        logger.info(f"Created new medical record for patient {data['patient_id']}")
     
     # STEP 3: Get nurse
     try:
@@ -255,26 +263,313 @@ def create_assignment(request):
         'data': response_serializer.data
     }, status=status.HTTP_201_CREATED)
 
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def update_assignment(request, assignment_id):
+    """
+    Update questionnaire assignment
+    Admin/Nurse can modify questions, frequency, dates, etc.
+    """
+    user = request.user
+    
+    # Check permission
+    if user.user_type not in ['ADMIN', 'NURSE']:
+        raise APIError("Permission denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    # Get the assignment
+    try:
+        assignment = QuestionnaireAssignment.objects.get(assignment_id=assignment_id)
+    except QuestionnaireAssignment.DoesNotExist:
+        raise APIError("Assignment not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # Check if assignment is completed (can't modify completed assignments)
+    if assignment.status == 'completed':
+        raise APIError("Cannot modify completed assignment", status_code=status.HTTP_400_BAD_REQUEST)
+    
+    # Validate input data
+    serializer = UpdateAssignmentSerializer(data=request.data)
+    if not serializer.is_valid():
+        raise APIError("Validation error", errors=serializer.errors)
+    
+    data = serializer.validated_data
+    
+    # Track changes for logging
+    changes = []
+    
+    # STEP 1: Update basic fields if provided
+    if 'frequency' in data and data['frequency'] != assignment.frequency:
+        assignment.frequency = data['frequency']
+        changes.append(f"frequency: {assignment.frequency} -> {data['frequency']}")
+    
+    if 'start_date' in data and data['start_date'] != assignment.start_date:
+        assignment.start_date = data['start_date']
+        changes.append(f"start_date: {assignment.start_date} -> {data['start_date']}")
+    
+    if 'end_date' in data:
+        if data['end_date'] != assignment.end_date:
+            assignment.end_date = data['end_date']
+            changes.append(f"end_date: {assignment.end_date} -> {data['end_date']}")
+    
+    if 'status' in data and data['status'] != assignment.status:
+        # Validate status transition
+        if assignment.status == 'completed' and data['status'] != 'completed':
+            raise APIError("Cannot change completed assignment status", status_code=status.HTTP_400_BAD_REQUEST)
+        
+        assignment.status = data['status']
+        changes.append(f"status: {assignment.status} -> {data['status']}")
+    
+    assignment.save()
+    
+    # STEP 2: Update questions if provided
+    questions_updated = False
+    if 'question_ids' in data:
+        questions_updated = update_assignment_questions(assignment, data['question_ids'], changes)
+    
+    logger.info(f"Assignment {assignment_id} updated by {user.username}. Changes: {changes}")
+    
+    # STEP 3: Return updated assignment
+    response_serializer = QuestionnaireAssignmentSerializer(assignment)
+    return Response({
+        'success': True,
+        'message': 'Assignment updated successfully',
+        'changes': changes,
+        'questions_updated': questions_updated,
+        'data': response_serializer.data
+    })
+
+def update_assignment_questions(assignment, new_question_ids, changes):
+    """
+    Helper function to update questions in an assignment
+    """
+    # Get current questions
+    current_assigned = AssignedQuestion.objects.filter(
+        questionnaire_assignment=assignment
+    ).select_related('question')
+    
+    current_question_ids = set(aq.question.question_id for aq in current_assigned)
+    new_question_ids_set = set(new_question_ids)
+    
+    # Find questions to add and remove
+    to_add = new_question_ids_set - current_question_ids
+    to_remove = current_question_ids - new_question_ids_set
+    
+    if not to_add and not to_remove:
+        return False
+    
+    # Remove questions
+    if to_remove:
+        removed_count = AssignedQuestion.objects.filter(
+            questionnaire_assignment=assignment,
+            question__question_id__in=to_remove
+        ).delete()[0]
+        changes.append(f"removed {removed_count} questions")
+    
+    # Add new questions
+    if to_add:
+        # Get max current order
+        max_order = current_assigned.aggregate(models.Max('order'))['order__max'] or 0
+        
+        added_count = 0
+        for idx, question_id in enumerate(new_question_ids):
+            if question_id in to_add:
+                try:
+                    question = Question.objects.get(question_id=question_id)
+                    
+                    # Check if active
+                    if not question.is_active:
+                        logger.warning(f"Question {question_id} is not active, skipping")
+                        continue
+                    
+                    AssignedQuestion.objects.create(
+                        questionnaire_assignment=assignment,
+                        question=question,
+                        order=max_order + idx + 1,
+                        is_mandatory=True
+                    )
+                    added_count += 1
+                    
+                except Question.DoesNotExist:
+                    logger.warning(f"Question {question_id} not found, skipping")
+                    continue
+        
+        changes.append(f"added {added_count} questions")
+    
+    # Reorder all questions based on new list
+    reorder_assignment_questions(assignment, new_question_ids)
+    
+    return True
+
+def reorder_assignment_questions(assignment, question_ids):
+    """
+    Reorder questions based on the provided list
+    """
+    for idx, question_id in enumerate(question_ids):
+        try:
+            assigned = AssignedQuestion.objects.get(
+                questionnaire_assignment=assignment,
+                question__question_id=question_id
+            )
+            if assigned.order != idx + 1:
+                assigned.order = idx + 1
+                assigned.save()
+        except AssignedQuestion.DoesNotExist:
+            continue
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 @handle_errors
 def get_patient_assignments(request, patient_id):
     """Get all assignments for a patient"""
+    user = request.user
+    
+    # Check if patient exists
     try:
-        # Use patient_id instead of user_id
-        patient = PatientMedicalRecord.objects.get(patient_id=patient_id)
-        
-    except PatientMedicalRecord.DoesNotExist:
+        patient_profile = PatientProfile.objects.get(patient_id=patient_id)
+    except PatientProfile.DoesNotExist:
         raise APIError("Patient not found", status_code=status.HTTP_404_NOT_FOUND)
     
-    assignments = QuestionnaireAssignment.objects.filter(patient=patient)
+    # Permission check
+    if user.user_type == 'PATIENT':
+        try:
+            patient_user = PatientProfile.objects.get(user=user)
+            if patient_user.patient_id != patient_id:
+                raise APIError("Permission denied", status_code=status.HTTP_403_FORBIDDEN)
+        except PatientProfile.DoesNotExist:
+            raise APIError("Permission denied", status_code=status.HTTP_403_FORBIDDEN)
+    
+    # ✅ Get ALL medical records for this patient
+    medical_records = PatientMedicalRecord.objects.filter(patient_id=patient_id)
+    
+    if not medical_records.exists():
+        return Response({
+            'success': True,
+            'data': [],
+            'message': 'No medical records found for this patient'
+        })
+    
+    # ✅ Get assignments for ALL medical records
+    assignments = QuestionnaireAssignment.objects.filter(
+        patient__in=medical_records
+    ).select_related('patient', 'assigned_by').order_by('-created_at')
+    
     serializer = QuestionnaireAssignmentSerializer(assignments, many=True)
     
     return Response({
         'success': True,
+        'count': assignments.count(),
         'data': serializer.data
     })
 
+# questionnaires/views.py
+
+@api_view(['PUT', 'DELETE'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def assignment_detail(request, patient_id):
+    """Update or delete assignments for a specific patient"""
+    
+    try:
+        # Get the patient first
+        patient = PatientMedicalRecord.objects.get(patient_id=patient_id)
+        
+        # Get assignment_id from request data for PUT and DELETE
+        assignment_id = request.data.get('assignment_id')
+        
+        if not assignment_id:
+            raise APIError("assignment_id is required", status_code=status.HTTP_400_BAD_REQUEST)
+        
+        # Get the specific assignment for this patient
+        assignment = QuestionnaireAssignment.objects.get(
+            assignment_id=assignment_id, 
+            patient=patient
+        )
+        
+    except PatientMedicalRecord.DoesNotExist:
+        raise APIError("Patient not found", status_code=status.HTTP_404_NOT_FOUND)
+    except QuestionnaireAssignment.DoesNotExist:
+        raise APIError("Assignment not found for this patient", status_code=status.HTTP_404_NOT_FOUND)
+    
+    if request.method == 'PUT':
+        # Update assignment
+        status_value = request.data.get('status')
+        if status_value and status_value in ['ACTIVE', 'COMPLETED', 'EXPIRED', 'CANCELLED']:
+            assignment.status = status_value
+        
+        frequency = request.data.get('frequency')
+        if frequency and frequency in ['DAILY', 'WEEKLY', 'MONTHLY']:
+            assignment.frequency = frequency
+        
+        end_date = request.data.get('end_date')
+        if end_date:
+            assignment.end_date = end_date
+        
+        start_date = request.data.get('start_date')
+        if start_date:
+            assignment.start_date = start_date
+        
+        assignment.save()
+        
+        serializer = QuestionnaireAssignmentSerializer(assignment)
+        return Response({
+            'success': True,
+            'message': 'Assignment updated successfully',
+            'data': serializer.data
+        })
+    
+    elif request.method == 'DELETE':
+        # Delete assignment
+        assignment.delete()
+        return Response({
+            'success': True,
+            'message': f'Assignment {assignment_id} deleted successfully for patient {patient_id}'
+        })
+    
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def delete_all_assignments(request, patient_id):
+    """Delete ALL questionnaire assignments for a patient"""
+    
+    # Check if patient exists (same as GET)
+    try:
+        patient_profile = PatientProfile.objects.get(patient_id=patient_id)
+    except PatientProfile.DoesNotExist:
+        raise APIError("Patient not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+    # ✅ Get ALL medical records for this patient (same as GET)
+    medical_records = PatientMedicalRecord.objects.filter(patient_id=patient_id)
+    
+    if not medical_records.exists():
+        return Response({
+            'success': True,
+            'message': 'No medical records found for this patient',
+            'deleted_count': 0
+        })
+    
+    # ✅ Get ALL assignments for ALL medical records (same as GET)
+    assignments = QuestionnaireAssignment.objects.filter(
+        patient__in=medical_records
+    )
+    
+    count = assignments.count()
+    
+    if count == 0:
+        return Response({
+            'success': True,
+            'message': 'No assignments found for this patient',
+            'deleted_count': 0
+        })
+    
+    # ✅ Delete ALL assignments
+    assignments.delete()
+    
+    return Response({
+        'success': True,
+        'message': f'Successfully deleted {count} assignment(s) for patient {patient_profile.first_name} {patient_profile.last_name}',
+        'deleted_count': count,
+        'patient_id': patient_id
+    })
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -298,16 +593,30 @@ def submit_questionnaire_responses(request):
     # Initialize errors list at the beginning
     errors = []
     
-    # Get patient profile and medical record
+    # Get patient profile
     try:
         patient_profile = PatientProfile.objects.get(user=user)
-        patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
     except PatientProfile.DoesNotExist:
         raise APIError("Patient profile not found", status_code=status.HTTP_404_NOT_FOUND)
-    except PatientMedicalRecord.DoesNotExist:
-        # Auto-create medical record if missing
+    
+    # ✅ FIX: Handle multiple medical records - get the latest one
+    try:
+        patient_medical = PatientMedicalRecord.objects.filter(
+            patient=patient_profile
+        ).order_by('-created_at').first()
+        
+        if not patient_medical:
+            # Create new medical record if none exists
+            patient_medical = PatientMedicalRecord.objects.create(patient=patient_profile)
+            logger.info(f"Created new medical record for patient {patient_profile.patient_id}")
+        else:
+            logger.info(f"Using latest medical record {patient_medical.medical_record_id} for patient {patient_profile.patient_id}")
+            
+    except Exception as e:
+        logger.error(f"Error getting medical record: {e}")
+        # Fallback: create new
         patient_medical = PatientMedicalRecord.objects.create(patient=patient_profile)
-        logger.info(f"Created medical record for patient {patient_profile.patient_id}")
+        logger.info(f"Created fallback medical record for patient {patient_profile.patient_id}")
     
     # Get data from request - try multiple field names
     response_id = None
@@ -494,6 +803,9 @@ def submit_questionnaire_responses(request):
                 questionnaire_assignment=assignment,
                 is_completed=False
             )
+    
+    # Rest of your code remains the same...
+    # (Keep the rest of your function unchanged from here)
     
     # Get all assigned questions in order
     assigned_questions_list = list(AssignedQuestion.objects.filter(
@@ -1014,6 +1326,7 @@ def get_all_patient_responses(request):
     """
     API for admin to get all patient responses
     Admin can see all submitted questionnaires with answers
+    Can filter by specific patient and date range
     """
     
     # Check if user is admin
@@ -1021,10 +1334,11 @@ def get_all_patient_responses(request):
         raise APIError("Only admins can access this", status_code=status.HTTP_403_FORBIDDEN)
     
     # Get query parameters for filtering
+    patient_no = request.query_params.get('patient_no')
     patient_id = request.query_params.get('patient_id')
     from_date = request.query_params.get('from_date')
     to_date = request.query_params.get('to_date')
-    status = request.query_params.get('status')  # completed/pending
+    status = request.query_params.get('status')
     assignment_id = request.query_params.get('assignment_id')
     
     # Base queryset
@@ -1034,14 +1348,28 @@ def get_all_patient_responses(request):
     ).order_by('-completed_at')
     
     # Apply filters
-    if patient_id:
+    if patient_no:
+        responses = responses.filter(patient__patient__patient_no=patient_no)
+    elif patient_id:
         responses = responses.filter(patient__patient__patient_id=patient_id)
     
+    # Date filtering
+    from datetime import datetime, timedelta
+    
     if from_date:
-        responses = responses.filter(completed_at__date__gte=from_date)
+        try:
+            from_datetime = datetime.strptime(from_date, '%Y-%m-%d')
+            responses = responses.filter(completed_at__gte=from_datetime)
+        except ValueError:
+            raise APIError("Invalid from_date format. Use YYYY-MM-DD", status_code=400)
     
     if to_date:
-        responses = responses.filter(completed_at__date__lte=to_date)
+        try:
+            to_datetime = datetime.strptime(to_date, '%Y-%m-%d')
+            to_datetime_end = to_datetime + timedelta(days=1)
+            responses = responses.filter(completed_at__lt=to_datetime_end)
+        except ValueError:
+            raise APIError("Invalid to_date format. Use YYYY-MM-DD", status_code=400)
     
     if status:
         if status.lower() == 'completed':
@@ -1062,28 +1390,64 @@ def get_all_patient_responses(request):
     total_count = responses.count()
     paginated_responses = responses[start:end]
     
+    # Helper function to calculate age from date_of_birth
+    def calculate_age(date_of_birth):
+        if not date_of_birth:
+            return None
+        today = datetime.now().date()
+        return today.year - date_of_birth.year - (
+            (today.month, today.day) < (date_of_birth.month, date_of_birth.day)
+        )
+    
     # Prepare response data
     data = []
     for response in paginated_responses:
         # Get response count
         response_count = QuestionResponse.objects.filter(daily_response=response).count()
         
-        # Get assignment details - FIXED: removed 'name' field
+        # Get assignment details
         assignment = response.questionnaire_assignment
+        
+        # Get patient details - only use fields that exist
+        patient_mapping = response.patient
+        patient_profile = patient_mapping.patient if patient_mapping else None
+        user = patient_profile.user if patient_profile else None
+        
+        # Calculate age if date_of_birth exists
+        age = calculate_age(patient_profile.date_of_birth) if patient_profile and hasattr(patient_profile, 'date_of_birth') else None
+        
+        # Build patient info - ONLY WITH FIELDS THAT EXIST
+        patient_info = {
+            'patient_id': patient_profile.patient_id if patient_profile else None,
+            'patient_no': patient_profile.patient_no if patient_profile else None,
+            'full_name': f"{user.first_name} {user.last_name}".strip() if user else "Unknown",
+            'first_name': user.first_name if user else "",
+            'last_name': user.last_name if user else "",
+            'email': user.email if user else "",
+            'phone_number': user.phone_number if user else "",
+        }
+        
+        # Add optional fields only if they exist
+        if age is not None:
+            patient_info['age'] = age
+        
+        if patient_profile and hasattr(patient_profile, 'gender'):
+            patient_info['gender'] = patient_profile.gender
+        
+        if patient_profile and hasattr(patient_profile, 'patient_status'):
+            patient_info['patient_status'] = patient_profile.patient_status
+        
+        # Add date_of_birth if it exists
+        if patient_profile and hasattr(patient_profile, 'date_of_birth') and patient_profile.date_of_birth:
+            patient_info['date_of_birth'] = patient_profile.date_of_birth
         
         data.append({
             'response_id': response.response_id,
-            'patient': {
-                'id': response.patient.patient.patient_id,
-                'name': f"{response.patient.patient.user.first_name} {response.patient.patient.user.last_name}",
-                'email': response.patient.patient.user.email
-            },
+            'patient': patient_info,
             'assignment': {
-                'id': assignment.assignment_id,
-                # 'name' field removed - use assignment_id or add any other field that exists
-                # You can use assignment_id as display value or add any other field from your model
-                'title': f"Assignment {str(assignment.assignment_id)[:8]}",  # Temporary display
-                'frequency': assignment.frequency if hasattr(assignment, 'frequency') else None
+                'id': assignment.assignment_id if assignment else None,
+                'title': f"Assignment {str(assignment.assignment_id)[:8]}" if assignment else "Unknown",
+                'frequency': getattr(assignment, 'frequency', None) if assignment else None
             },
             'response_date': response.response_date,
             'completed_at': response.completed_at,
@@ -1095,11 +1459,19 @@ def get_all_patient_responses(request):
     return Response({
         'success': True,
         'data': data,
+        'filters_applied': {
+            'patient_no': patient_no,
+            'patient_id': patient_id,
+            'from_date': from_date,
+            'to_date': to_date,
+            'status': status,
+            'assignment_id': assignment_id
+        },
         'pagination': {
             'page': page,
             'page_size': page_size,
             'total_count': total_count,
-            'total_pages': (total_count + page_size - 1) // page_size
+            'total_pages': (total_count + page_size - 1) // page_size if page_size > 0 else 0
         }
     })
 
@@ -1203,7 +1575,7 @@ def get_response_detail(request, response_id):
 def get_patient_response_history(request, patient_id):
     """
     API for admin to get response history of a specific patient
-    Using simple Django ORM queries that work with MongoDB
+    Working with MongoDB/Djongo
     """
     
     # Check if user is admin
@@ -1211,144 +1583,42 @@ def get_patient_response_history(request, patient_id):
         raise APIError("Only admins can access this", status_code=status.HTTP_403_FORBIDDEN)
     
     try:
-        # Get patient
+        from accounts.models import PatientProfile
+        from datetime import date
+        
+        # Get patient profile
         patient_profile = PatientProfile.objects.get(patient_id=patient_id)
         
-        # STEP 1: Get all daily responses for this patient
-        # Try different possible relationships
-        daily_responses = None
+        print(f"Looking for responses for patient_id: {patient_id}")
         
-        # Try with patient_medical relationship first
-        try:
-            patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
-            daily_responses = DailyResponse.objects.filter(
-                patient=patient_medical,
-                is_completed=True
-            ).order_by('-completed_at')[:20]
-            print(f"Found {daily_responses.count()} responses via medical record")
-        except PatientMedicalRecord.DoesNotExist:
-            print("No medical record found")
+        # Get today's date
+        today_date = date.today()
+        print(f"Today's date: {today_date}")
         
-        # If no responses found, try direct patient_id field
-        if not daily_responses or daily_responses.count() == 0:
-            daily_responses = DailyResponse.objects.filter(
-                patient_id=patient_profile.id,
-                is_completed=True
-            ).order_by('-completed_at')[:20]
-            print(f"Found {daily_responses.count()} responses via direct patient_id")
+        # Get all DailyResponses without filter first (to avoid MongoDB issues)
+        all_responses = DailyResponse.objects.all().order_by('-response_id')
         
-        # If still no responses, try with patient_profile id as string
-        if not daily_responses or daily_responses.count() == 0:
-            daily_responses = DailyResponse.objects.filter(
-                patient_id=str(patient_profile.id),
-                is_completed=True
-            ).order_by('-completed_at')[:20]
-            print(f"Found {daily_responses.count()} responses via string patient_id")
-        
-        history = []
-        
-        # Process each daily response
-        for dr in daily_responses:
-            # Get questions for this response
-            question_responses = QuestionResponse.objects.filter(
-                daily_response=dr
-            )[:15]  # Limit to 15 questions per response
-            
-            questions_list = []
-            for qr in question_responses:
-                # Get question details
-                question_text = "Question not found"
-                question_type = None
-                answer = None
-                
-                # Try to get assigned question
-                if qr.assigned_question_id:
-                    try:
-                        # Try to get assigned question
-                        from questionnaires.models import AssignedQuestion
-                        assigned_q = AssignedQuestion.objects.filter(
-                            assigned_question_id=qr.assigned_question_id
-                        ).first()
-                        
-                        if assigned_q and assigned_q.question_id:
-                            from questionnaires.models import Question
-                            question = Question.objects.filter(
-                                question_id=assigned_q.question_id
-                            ).first()
-                            
-                            if question:
-                                question_text = question.text
-                                question_type = question.question_type
-                    except:
-                        pass
-                
-                # Get answer based on type
-                if qr.answer_text:
-                    answer = qr.answer_text
-                elif qr.answer_choice:
-                    answer = qr.answer_choice
-                elif qr.answer_rating is not None:
-                    answer = str(qr.answer_rating)
-                elif qr.answer_boolean is not None:
-                    answer = 'Yes' if qr.answer_boolean else 'No'
-                else:
-                    answer = 'No answer'
-                
-                questions_list.append({
-                    'question': question_text[:100] if question_text else 'Question',
-                    'answer': answer
-                })
-            
-            # Get assignment details if available
-            assignment_info = None
-            if dr.questionnaire_assignment_id:
-                try:
-                    from questionnaires.models import QuestionnaireAssignment
-                    assignment = QuestionnaireAssignment.objects.filter(
-                        assignment_id=dr.questionnaire_assignment_id
-                    ).first()
+        # Filter responses that belong to this patient AND are from today
+        patient_responses = []
+        for response in all_responses:
+            try:
+                # Check if response is from today
+                if response.response_date != today_date:
+                    continue  # Skip if not today's response
                     
-                    if assignment:
-                        assignment_info = {
-                            'id': str(assignment.assignment_id),
-                            'frequency': assignment.frequency if hasattr(assignment, 'frequency') else 'unknown',
-                            'status': assignment.status if hasattr(assignment, 'status') else 'unknown'
-                        }
-                except:
-                    pass
-            
-            history.append({
-                'response_id': str(dr.response_id),
-                'completed_at': dr.completed_at,
-                'response_date': dr.response_date if hasattr(dr, 'response_date') else dr.completed_at.date(),
-                'assignment': assignment_info,
-                'total_questions': len(questions_list),
-                'questions': questions_list,
-                'preview': questions_list[:3]  # First 3 for preview
-            })
+                # This matches the logic from get_response_detail
+                if hasattr(response, 'patient') and response.patient:
+                    if hasattr(response.patient, 'patient') and response.patient.patient:
+                        if response.patient.patient.patient_id == patient_profile.patient_id:
+                            patient_responses.append(response)
+                            print(f"Found today's response {response.response_id} - Completed: {response.is_completed}")
+            except Exception as e:
+                print(f"Error checking response {response.response_id}: {e}")
+                continue
         
-        return Response({
-            'success': True,
-            'patient': {
-                'patient_id': patient_profile.patient_id,
-                'name': f"{patient_profile.user.first_name} {patient_profile.user.last_name}",
-                'email': patient_profile.user.email
-            },
-            'total_responses': len(history),
-            'data': history
-        })
+        print(f"Total today's responses found: {len(patient_responses)}")
         
-    except PatientProfile.DoesNotExist:
-        raise APIError("Patient not found", status_code=status.HTTP_404_NOT_FOUND)
-        
-    except Exception as e:
-        print(f"Error in get_patient_response_history: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # Return basic patient info even if responses fail
-        try:
-            patient_profile = PatientProfile.objects.get(patient_id=patient_id)
+        if not patient_responses:
             return Response({
                 'success': True,
                 'patient': {
@@ -1358,13 +1628,88 @@ def get_patient_response_history(request, patient_id):
                 },
                 'total_responses': 0,
                 'data': [],
-                'message': 'Response history temporarily unavailable'
+                'message': f'No responses found for today ({today_date})',
+                'today_status': 'PENDING'  # ← Today task pending
             })
-        except:
-            return Response({
-                'success': False,
-                'error': 'Unable to fetch patient data'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Process the responses (today's responses only)
+        history = []
+        for dr in patient_responses:
+            # Get questions for this response
+            question_responses = QuestionResponse.objects.filter(
+                daily_response=dr
+            ).order_by('assigned_question__order')
+            
+            questions_list = []
+            for qr in question_responses[:5]:
+                try:
+                    if qr.assigned_question and qr.assigned_question.question:
+                        question = qr.assigned_question.question
+                        questions_list.append({
+                            'question': question.text[:100] if question.text else 'No question',
+                            'answer': get_submit_answer_text(qr)
+                        })
+                    else:
+                        questions_list.append({
+                            'question': 'Question not found',
+                            'answer': 'Answer not available'
+                        })
+                except Exception as e:
+                    questions_list.append({
+                        'question': 'Error loading question',
+                        'answer': str(e)
+                    })
+            
+            # Get assignment info
+            assignment_info = {}
+            if dr.questionnaire_assignment:
+                assignment_info = {
+                    'assignment_id': dr.questionnaire_assignment.assignment_id,
+                    'frequency': dr.questionnaire_assignment.frequency if hasattr(dr.questionnaire_assignment, 'frequency') else None,
+                }
+            
+            history.append({
+                'response_id': dr.response_id,
+                'completed_at': dr.completed_at,
+                'response_date': dr.response_date,
+                'is_completed': dr.is_completed,
+                'today_status': 'COMPLETED' if dr.is_completed else 'PENDING',  # ← Status based on completion
+                'assignment_info': assignment_info,
+                'total_questions': question_responses.count(),
+                'preview_questions': questions_list
+            })
+        
+        # Determine overall status
+        overall_status = 'COMPLETED' if history and history[0]['is_completed'] else 'PENDING'
+        
+        return Response({
+            'success': True,
+            'patient': {
+                'patient_id': patient_profile.patient_id,
+                'name': f"{patient_profile.user.first_name} {patient_profile.user.last_name}",
+                'email': patient_profile.user.email
+            },
+            'today_date': str(today_date),
+            'today_status': overall_status,  # ← Overall status for today
+            'total_responses': len(history),
+            'data': history
+        })
+        
+    except PatientProfile.DoesNotExist:
+        return Response({
+            'success': False,
+            'error': 'Patient not found'
+        }, status=status.HTTP_404_NOT_FOUND)
+        
+    except Exception as e:
+        print(f"Error in get_patient_response_history: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        return Response({
+            'success': False,
+            'error': str(e)
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -2155,3 +2500,7 @@ def get_patient_response_summary(request, patient_id):
         'success': True,
         'data': summary
     })
+
+
+
+

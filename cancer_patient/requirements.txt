@@ -30,11 +30,7 @@ ffmpeg
 
 # word convert 
 python-docx==1.1.0
-
 channels channels-redis daphne
-
 pydub speechrecognition ffmpeg-python
-
 scipy
-
 mutagen

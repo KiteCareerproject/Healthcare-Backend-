@@ -25,7 +25,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-your-secret-key-here')
 
 DEBUG = True
 
-ALLOWED_HOSTS = ['192.168.1.4', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['192.168.1.13', 'localhost', '127.0.0.1']
 
 # Application definition
 INSTALLED_APPS = [
@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     'monitoring',
     'dashboard',
     'notifications',
+    'chat',
 ]
 
 MIDDLEWARE = [
@@ -116,9 +117,9 @@ REST_FRAMEWORK = {
 # JWT Settings
 # JWT Settings - Add refresh token settings
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(days=2),  # Short-lived access token
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),    # Long-lived refresh token
-    'ROTATE_REFRESH_TOKENS': True,                  # Get new refresh token on refresh
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=5),  
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=10),    
+    'ROTATE_REFRESH_TOKENS': True,                  
     'BLACKLIST_AFTER_ROTATION': True,               
     'UPDATE_LAST_LOGIN': True,
     
@@ -152,7 +153,12 @@ CORS_ALLOWED_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://192.168.1.3:3000",
     "http://192.168.1.3:5174",
-    "http://localhost:5173"     
+    "http://localhost:5173",
+    "http://localhost:8081",     
+    "http://127.0.0.1:8081",
+    "http://192.168.1.30:8000",   # Backend itself
+    "http://192.168.1.3:8000",    # Mobile device IP
+    "exp://192.168.1.3:8081",     # Expo development URL
 ]
 
 
@@ -161,6 +167,12 @@ STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'static'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# File upload settings
+ALLOWED_UPLOAD_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.pdf', '.doc', '.docx']
+MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5MB
+
+APPEND_SLASH = False
 
 # Custom User Model
 AUTH_USER_MODEL = 'accounts.User'
@@ -181,3 +193,35 @@ CHANNEL_LAYERS = {
         # },
     }
 }
+
+
+
+
+
+
+# // ✅ Get all medications - FIX THIS ONE
+# export const getMedicationsByRecordId = async (recordId) => {
+#   try {
+#     if (!recordId) {
+#       console.error("❌ Missing recordId");
+#       return { data: [] };
+#     }
+    
+#     console.log("🔍 Fetching medications for record:", recordId);
+    
+#     // FIX: Add /medications/ to the URL
+#     const response = await API.get(
+#       `/patients/medical-records/${recordId}/medications/`,
+#       {
+#         headers: getAuthHeaders(),
+#       }
+#     );
+    
+#     console.log("✅ Medications fetched:", response.data);
+#     return response;
+    
+#   } catch (error) {
+#     console.error("❌ Error fetching medications:", error);
+#     return { data: [] };
+#   }
+# };

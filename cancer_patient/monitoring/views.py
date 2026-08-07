@@ -267,7 +267,6 @@ def acknowledge_alert(request, alert_id):
     """Acknowledge an alert"""
     user = request.user
     
-    # Check if user has permission
     if user.user_type not in ['NURSE', 'DOCTOR']:
         return Response({
             'success': False,
@@ -292,11 +291,11 @@ def acknowledge_alert(request, alert_id):
     # Update alert status
     alert.status = 'ACKNOWLEDGED'
     alert.acknowledged_at = timezone.now()
-    alert.acknowledged_by = user  # Add this field to track who acknowledged
+    alert.acknowledged_by = user  
     alert.save()
     
     logger.info(f"Alert {alert_id} acknowledged by {user.username} (ID: {user.id})")
-    
+
     return Response({
         'success': True,
         'message': 'Alert acknowledged successfully',
@@ -1057,7 +1056,13 @@ def get_voice_templates(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_alert_to_patient(request):
-    """Send an alert to a specific patient"""
+    """Send an alert to a specific patient with notifications"""
+    
+    from rest_framework import status
+    from django.core.mail import send_mail
+    from django.conf import settings
+    from datetime import datetime
+    from notifications.models import Notification, NotificationDelivery
     
     # Only nurses, doctors, and admins can send alerts
     if request.user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
@@ -1070,110 +1075,58 @@ def send_alert_to_patient(request):
     print("=== SEND ALERT DEBUG ===")
     print("Content-Type:", request.content_type)
     print("Data:", request.data)
-    print("POST:", request.POST)
     print("========================")
     
-    # ===== FIX: Extract data with flexible field names =====
-    
-    # Patient ID - try multiple field names
+    # Extract data
     patient_id = None
-    possible_patient_keys = [
-        'patient_id', 'patientId', 'patient', 'PatientID', 
-        'patient-id', 'pid', 'patientid', 'patientID'
-    ]
+    if isinstance(request.data, dict):
+        patient_id = request.data.get('patient_id') or request.data.get('patientId')
+    
+    # Alert level (priority)
+    alert_level = 'MEDIUM'
+    possible_level_keys = ['priority', 'level', 'severity', 'alert_level', 'urgent']
     
     if isinstance(request.data, dict):
-        for key in possible_patient_keys:
-            if key in request.data:
-                patient_id = request.data[key]
-                print(f"Found patient_id with key: {key}")
-                break
-    
-    if not patient_id and request.POST:
-        for key in request.POST.keys():
-            clean_key = key.strip().replace('"', '').lower().replace('-', '').replace('_', '')
-            if clean_key in ['patientid', 'patient', 'pid']:
-                patient_id = request.POST.get(key)
-                print(f"Found patient_id in POST with key: {key}")
-                break
-    
-    # Alert type
-    alert_type = 'GENERAL'
-    possible_type_keys = ['alert_type', 'type', 'alertType', 'category']
-    
-    if isinstance(request.data, dict):
-        for key in possible_type_keys:
+        for key in possible_level_keys:
             if key in request.data:
                 val = request.data[key]
-                # Validate against allowed types
-                allowed_types = ['QUESTIONNAIRE', 'MEDICATION', 'APPOINTMENT', 'SYMPTOM', 'GENERAL']
-                if val in allowed_types:
-                    alert_type = val
-                break
-    
-    # Priority
-    priority = 'MEDIUM'
-    possible_priority_keys = ['priority', 'level', 'severity', 'urgent']
-    
-    if isinstance(request.data, dict):
-        for key in possible_priority_keys:
-            if key in request.data:
-                val = request.data[key]
-                allowed_priorities = ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
-                if val in allowed_priorities:
-                    priority = val
+                if isinstance(val, str):
+                    val = val.upper()
+                allowed_levels = ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
+                if val in allowed_levels:
+                    alert_level = val
                 break
     
     # Title
     title = None
-    possible_title_keys = ['title', 'subject', 'heading', 'Title', 'TITLE']
-    
     if isinstance(request.data, dict):
-        for key in possible_title_keys:
-            if key in request.data:
-                title = request.data[key]
-                print(f"Found title with key: {key}")
-                break
+        title = request.data.get('title') or request.data.get('subject')
     
-    if not title and request.POST:
-        for key in request.POST.keys():
-            clean_key = key.strip().replace('"', '').lower()
-            if clean_key in ['title', 'subject', 'heading']:
-                title = request.POST.get(key)
-                print(f"Found title in POST with key: {key}")
-                break
-    
-    # Message
-    message = None
-    possible_message_keys = ['message', 'msg', 'content', 'text', 'body', 'description']
-    
+    # Description (message)
+    description = None
     if isinstance(request.data, dict):
-        for key in possible_message_keys:
-            if key in request.data:
-                message = request.data[key]
-                print(f"Found message with key: {key}")
-                break
+        description = request.data.get('message') or request.data.get('description') or request.data.get('content')
     
-    if not message and request.POST:
-        for key in request.POST.keys():
-            clean_key = key.strip().replace('"', '').lower()
-            if clean_key in ['message', 'msg', 'content', 'text', 'body']:
-                message = request.POST.get(key)
-                print(f"Found message in POST with key: {key}")
-                break
-    
-    # Send via (delivery channels)
-    send_via = ['IN_APP']
-    if isinstance(request.data, dict) and 'send_via' in request.data:
-        send_via = request.data['send_via']
-    
-    # Assignment ID (optional)
-    assignment_id = None
+    # Status
+    alert_status = 'PENDING'
     if isinstance(request.data, dict):
-        for key in ['assignment_id', 'assignment', 'assignmentId']:
-            if key in request.data:
-                assignment_id = request.data[key]
-                break
+        alert_status = request.data.get('status', 'PENDING').upper()
+        allowed_status = ['PENDING', 'ACKNOWLEDGED', 'RESOLVED', 'ESCALATED']
+        if alert_status not in allowed_status:
+            alert_status = 'PENDING'
+    
+    # Send via channels
+    send_via = request.data.get('send_via', ['WEBSOCKET'])
+    if isinstance(send_via, str):
+        send_via = [send_via]
+    
+    # Action URL (optional)
+    action_url = request.data.get('action_url', None)
+    
+    # Trigger conditions
+    trigger_conditions = {}
+    if isinstance(request.data, dict):
+        trigger_conditions = request.data.get('trigger_conditions', {})
     
     # Validate required fields
     if not patient_id:
@@ -1182,7 +1135,6 @@ def send_alert_to_patient(request):
             'error': 'Patient ID is required',
             'debug': {
                 'received_data': dict(request.data) if isinstance(request.data, dict) else str(request.data),
-                'received_post': dict(request.POST) if request.POST else {}
             }
         }, status=status.HTTP_400_BAD_REQUEST)
     
@@ -1192,14 +1144,18 @@ def send_alert_to_patient(request):
             'error': 'Alert title is required'
         }, status=status.HTTP_400_BAD_REQUEST)
     
-    if not message:
+    if not description:
         return Response({
             'success': False,
-            'error': 'Alert message is required'
+            'error': 'Alert description/message is required'
         }, status=status.HTTP_400_BAD_REQUEST)
     
     # Get patient medical record
     try:
+        patient_medical = None
+        patient_profile = None
+        patient_user = None
+        
         # Try to find by medical_record_id
         patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
         
@@ -1208,16 +1164,18 @@ def send_alert_to_patient(request):
             patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
             if patient_profile:
                 patient_medical = PatientMedicalRecord.objects.filter(patient=patient_profile).first()
+                patient_user = patient_profile.user
         
         if not patient_medical:
             # Try by user ID
-            if patient_id.isdigit():
+            if str(patient_id).isdigit():
                 try:
                     from accounts.models import User
                     user = User.objects.get(id=int(patient_id))
                     if user.user_type == 'PATIENT':
                         patient_profile = PatientProfile.objects.get(user=user)
                         patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+                        patient_user = user
                 except:
                     pass
         
@@ -1226,6 +1184,11 @@ def send_alert_to_patient(request):
                 'success': False,
                 'error': f'Patient with ID {patient_id} not found'
             }, status=status.HTTP_404_NOT_FOUND)
+        
+        # If patient_user is still None, try to get it
+        if not patient_user and patient_medical.patient:
+            patient_user = patient_medical.patient.user
+            patient_profile = patient_medical.patient
             
     except Exception as e:
         logger.error(f"Error finding patient: {str(e)}")
@@ -1234,74 +1197,232 @@ def send_alert_to_patient(request):
             'error': f'Error finding patient: {str(e)}'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    # Get assignment if provided
-    assignment = None
-    if assignment_id:
-        try:
-            assignment = QuestionnaireAssignment.objects.get(assignment_id=assignment_id)
-        except QuestionnaireAssignment.DoesNotExist:
-            logger.warning(f"Assignment {assignment_id} not found")
-    
     # Create the alert
     try:
         alert = Alert.objects.create(
             patient=patient_medical,
-            alert_type=alert_type,
-            priority=priority,
             title=title,
-            message=message,
-            assignment=assignment,
-            status='PENDING',
-            created_by=request.user
+            description=description,
+            alert_level=alert_level,
+            status=alert_status,
+            trigger_conditions=trigger_conditions
         )
         
-        # Add to recipients
-        AlertRecipient.objects.create(
-            alert=alert,
-            patient=patient_medical,
-            user=patient_medical.patient.user if patient_medical.patient.user else None,
-            status='PENDING'
-        )
+        # ===== CREATE NOTIFICATION =====
+        notifications_sent = {
+            'websocket': False,
+            'email': False,
+            'push': False,
+            'sms': False,
+            'in_app': False
+        }
         
-        # Log the action
-        logger.info(f"Alert {alert.alert_id} created for patient {patient_id} by {request.user.username}")
-        
-        # TODO: Actually send the alert via selected channels
-        # This would integrate with SMS/Email/Push notification services
-        if 'SMS' in send_via:
-            # Send SMS logic here
-            pass
-        
-        if 'EMAIL' in send_via:
-            # Send Email logic here
-            pass
-        
-        if 'PUSH' in send_via:
-            # Send Push notification logic here
-            pass
-        
-        # Update status to SENT if any channel was used
-        if send_via != ['IN_APP']:
-            alert.status = 'SENT'
-            alert.sent_at = timezone.now()
-            alert.sent_via = send_via
-            alert.save()
+        try:
+            # Create the notification record
+            notification = Notification.objects.create(
+                recipient=patient_user,
+                notification_type='ALERT',
+                priority=alert_level,
+                title=title,
+                message=description,
+                related_patient=patient_medical,
+                related_alert=alert,
+                action_url=action_url,
+                is_sent=False,
+                is_delivered=False,
+                metadata={
+                    'created_by': request.user.username,
+                    'created_by_type': request.user.user_type,
+                    'alert_id': alert.alert_id,
+                    'alert_level': alert_level,
+                    'trigger_conditions': trigger_conditions
+                }
+            )
             
-            # Update recipient
-            recipient = alert.recipients.first()
-            if recipient:
-                recipient.status = 'SENT'
-                recipient.sent_at = timezone.now()
-                recipient.save()
+            logger.info(f"Notification {notification.notification_id} created for patient {patient_id}")
+            
+            # ===== SEND VIA DIFFERENT CHANNELS =====
+            
+            # 1. WebSocket (Real-time)
+            if 'WEBSOCKET' in send_via or 'websocket' in send_via:
+                try:
+                    # Create delivery record
+                    delivery = NotificationDelivery.objects.create(
+                        notification=notification,
+                        delivery_method='WEBSOCKET',
+                        status='PENDING',
+                        channel_name=f'user_{patient_user.id}'
+                    )
+                    
+                    # Try to send via WebSocket
+                    from channels.layers import get_channel_layer
+                    from asgiref.sync import async_to_sync
+                    
+                    channel_layer = get_channel_layer()
+                    
+                    # Send to user's personal channel
+                    group_name = f'user_{patient_user.id}'
+                    async_to_sync(channel_layer.group_send)(
+                        group_name,
+                        {
+                            'type': 'send_notification',
+                            'notification_id': notification.notification_id,
+                            'title': title,
+                            'message': description,
+                            'priority': alert_level,
+                            'notification_type': 'ALERT',
+                            'action_url': action_url,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                    )
+                    
+                    # Update delivery status
+                    delivery.status = 'SENT'
+                    delivery.sent_at = datetime.now()
+                    delivery.save()
+                    
+                    # Update notification
+                    notification.delivered_via_websocket = True
+                    notification.websocket_delivered_at = datetime.now()
+                    notification.is_sent = True
+                    notification.sent_at = datetime.now()
+                    notification.save()
+                    
+                    notifications_sent['websocket'] = True
+                    logger.info(f"WebSocket notification sent to user {patient_user.id}")
+                    
+                except Exception as e:
+                    logger.error(f"WebSocket delivery failed: {str(e)}")
+                    NotificationDelivery.objects.create(
+                        notification=notification,
+                        delivery_method='WEBSOCKET',
+                        status='FAILED',
+                        error_message=str(e),
+                        retry_count=1
+                    )
+            
+            # 2. Email
+            if 'EMAIL' in send_via or 'email' in send_via:
+                try:
+                    if patient_user and patient_user.email:
+                        # Create delivery record
+                        delivery = NotificationDelivery.objects.create(
+                            notification=notification,
+                            delivery_method='EMAIL',
+                            status='PENDING'
+                        )
+                        
+                        # Send email
+                        email_subject = f"[{alert_level}] {title}"
+                        email_message = f"""
+                        Dear {patient_user.get_full_name() or patient_user.username},
+                        
+                        {description}
+                        
+                        Alert Details:
+                        - Priority: {alert_level}
+                        - Type: Alert
+                        - Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                        
+                        Please log in to your account to view more details.
+                        
+                        Thank you,
+                        Cancer Patient Management System
+                        """
+                        
+                        try:
+                            send_mail(
+                                subject=email_subject,
+                                message=email_message,
+                                from_email=settings.DEFAULT_FROM_EMAIL,
+                                recipient_list=[patient_user.email],
+                                fail_silently=True,
+                            )
+                            
+                            delivery.status = 'SENT'
+                            delivery.sent_at = datetime.now()
+                            delivery.save()
+                            
+                            notifications_sent['email'] = True
+                            logger.info(f"Email sent to {patient_user.email}")
+                        except Exception as email_error:
+                            delivery.status = 'FAILED'
+                            delivery.error_message = str(email_error)
+                            delivery.save()
+                            logger.warning(f"Email failed: {str(email_error)}")
+                    else:
+                        logger.warning(f"Patient {patient_id} has no email")
+                except Exception as e:
+                    logger.error(f"Email delivery error: {str(e)}")
+            
+            # 3. In-App Notification
+            if 'IN_APP' in send_via or 'in_app' in send_via:
+                try:
+                    delivery = NotificationDelivery.objects.create(
+                        notification=notification,
+                        delivery_method='IN_APP',
+                        status='SENT',
+                        sent_at=datetime.now()
+                    )
+                    notifications_sent['in_app'] = True
+                    logger.info("In-app notification created")
+                except Exception as e:
+                    logger.error(f"In-app delivery error: {str(e)}")
+            
+            # 4. Push Notification (if configured)
+            if 'PUSH' in send_via or 'push' in send_via:
+                try:
+                    # Check if user has FCM token
+                    if hasattr(patient_user, 'fcm_token') and patient_user.fcm_token:
+                        # Add your Firebase push notification logic here
+                        # This requires Firebase configuration
+                        NotificationDelivery.objects.create(
+                            notification=notification,
+                            delivery_method='PUSH',
+                            status='PENDING',
+                            channel_name=patient_user.fcm_token
+                        )
+                        logger.info(f"Push notification would be sent to {patient_user.fcm_token}")
+                    else:
+                        logger.warning(f"User {patient_user.id} has no FCM token")
+                except Exception as e:
+                    logger.error(f"Push notification error: {str(e)}")
+            
+            # 5. SMS (if configured)
+            if 'SMS' in send_via or 'sms' in send_via:
+                try:
+                    if patient_profile and patient_profile.phone:
+                        NotificationDelivery.objects.create(
+                            notification=notification,
+                            delivery_method='SMS',
+                            status='PENDING'
+                        )
+                        logger.info(f"SMS would be sent to {patient_profile.phone}")
+                    else:
+                        logger.warning(f"Patient {patient_id} has no phone")
+                except Exception as e:
+                    logger.error(f"SMS error: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Error creating notification: {str(e)}")
         
         # Return success response
-        from .serializers import AlertSerializer
-        serializer = AlertSerializer(alert, context={'request': request})
-        
         return Response({
             'success': True,
             'message': f'Alert sent to patient successfully',
-            'data': serializer.data
+            'data': {
+                'alert_id': alert.alert_id,
+                'title': alert.title,
+                'description': alert.description,
+                'alert_level': alert.alert_level,
+                'status': alert.status,
+                'created_at': alert.created_at,
+                'trigger_conditions': alert.trigger_conditions,
+                'notification': {
+                    'id': notification.notification_id if 'notification' in locals() else None,
+                    'notifications_sent': notifications_sent
+                }
+            }
         }, status=status.HTTP_201_CREATED)
         
     except Exception as e:
@@ -1312,10 +1433,15 @@ def send_alert_to_patient(request):
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+from notifications.models import Notification, NotificationDelivery, NotificationPreference
+from django.utils import timezone
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def send_bulk_alerts(request):
-    """Send alerts to multiple patients at once"""
+    """Send alerts to multiple patients at once with notifications"""
+    
+    from rest_framework import status
     
     if request.user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
         return Response({
@@ -1327,8 +1453,9 @@ def send_bulk_alerts(request):
     patient_ids = request.data.get('patient_ids', [])
     title = request.data.get('title')
     message = request.data.get('message')
-    alert_type = request.data.get('alert_type', 'GENERAL')
-    priority = request.data.get('priority', 'MEDIUM')
+    alert_level = request.data.get('priority', 'MEDIUM')  # Changed to alert_level
+    send_via = request.data.get('send_via', ['WEBSOCKET', 'IN_APP'])
+    action_url = request.data.get('action_url', None)
     
     if not patient_ids or not isinstance(patient_ids, list):
         return Response({
@@ -1345,46 +1472,191 @@ def send_bulk_alerts(request):
     # Track results
     successful = []
     failed = []
+    notifications_created = []
     
     for patient_id in patient_ids:
         try:
             # Find patient
+            patient_medical = None
+            patient_user = None
+            patient_profile = None
+            
+            # Try to find by medical_record_id
             patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
             
             if not patient_medical:
                 patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
                 if patient_profile:
-                    patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+                    patient_medical = PatientMedicalRecord.objects.filter(patient=patient_profile).first()
+                    patient_user = patient_profile.user
             
             if not patient_medical:
                 failed.append({'id': patient_id, 'reason': 'Patient not found'})
                 continue
             
-            # Create alert
+            # Get user
+            if not patient_user and patient_medical.patient:
+                patient_user = patient_medical.patient.user
+                patient_profile = patient_medical.patient
+            
+            if not patient_user:
+                failed.append({'id': patient_id, 'reason': 'User not found'})
+                continue
+            
+            # Create alert in monitoring
             alert = Alert.objects.create(
                 patient=patient_medical,
-                alert_type=alert_type,
-                priority=priority,
+                title=title,
+                description=message,
+                alert_level=alert_level,
+                status='PENDING',
+                trigger_conditions={'bulk_send': True, 'created_by': request.user.username}
+            )
+            
+            # Create notification
+            notification = Notification.objects.create(
+                recipient=patient_user,
+                notification_type='ALERT',
+                priority=alert_level,
                 title=title,
                 message=message,
-                status='SENT',
-                sent_at=timezone.now(),
-                sent_via=['IN_APP'],
-                created_by=request.user
+                related_patient=patient_medical,
+                related_alert=alert,
+                action_url=action_url,
+                is_sent=False,
+                is_delivered=False,
+                metadata={
+                    'created_by': request.user.username,
+                    'created_by_type': request.user.user_type,
+                    'bulk_send': True,
+                    'alert_id': alert.alert_id
+                }
             )
             
-            # Add recipient
-            AlertRecipient.objects.create(
-                alert=alert,
-                patient=patient_medical,
-                user=patient_medical.patient.user if patient_medical.patient.user else None,
-                status='SENT',
-                sent_at=timezone.now()
-            )
+            notifications_created.append({
+                'patient_id': patient_id,
+                'notification_id': notification.notification_id,
+                'alert_id': alert.alert_id
+            })
             
-            successful.append(patient_id)
+            # Send via different channels
+            channel_results = {}
+            
+            # WebSocket
+            if 'WEBSOCKET' in send_via:
+                try:
+                    from channels.layers import get_channel_layer
+                    from asgiref.sync import async_to_sync
+                    
+                    channel_layer = get_channel_layer()
+                    group_name = f'user_{patient_user.id}'
+                    
+                    async_to_sync(channel_layer.group_send)(
+                        group_name,
+                        {
+                            'type': 'send_notification',
+                            'notification_id': notification.notification_id,
+                            'title': title,
+                            'message': message,
+                            'priority': alert_level,
+                            'notification_type': 'ALERT',
+                            'action_url': action_url,
+                            'timestamp': timezone.now().isoformat()
+                        }
+                    )
+                    
+                    # Update delivery
+                    NotificationDelivery.objects.create(
+                        notification=notification,
+                        delivery_method='WEBSOCKET',
+                        status='SENT',
+                        sent_at=timezone.now(),
+                        channel_name=group_name
+                    )
+                    
+                    notification.delivered_via_websocket = True
+                    notification.websocket_delivered_at = timezone.now()
+                    notification.is_sent = True
+                    notification.sent_at = timezone.now()
+                    notification.save()
+                    
+                    channel_results['websocket'] = True
+                    
+                except Exception as e:
+                    logger.error(f"WebSocket failed for patient {patient_id}: {str(e)}")
+                    NotificationDelivery.objects.create(
+                        notification=notification,
+                        delivery_method='WEBSOCKET',
+                        status='FAILED',
+                        error_message=str(e)
+                    )
+                    channel_results['websocket'] = False
+            
+            # Email
+            if 'EMAIL' in send_via:
+                try:
+                    from django.core.mail import send_mail
+                    from django.conf import settings
+                    
+                    if patient_user.email:
+                        email_subject = f"[{alert_level}] {title}"
+                        email_message = f"""
+                        Dear {patient_user.get_full_name() or patient_user.username},
+                        
+                        {message}
+                        
+                        Alert Details:
+                        - Priority: {alert_level}
+                        - Time: {timezone.now().strftime('%Y-%m-%d %H:%M:%S')}
+                        
+                        Please log in to your account to view more details.
+                        
+                        Thank you,
+                        Cancer Patient Management System
+                        """
+                        
+                        send_mail(
+                            subject=email_subject,
+                            message=email_message,
+                            from_email=settings.DEFAULT_FROM_EMAIL,
+                            recipient_list=[patient_user.email],
+                            fail_silently=True,
+                        )
+                        
+                        NotificationDelivery.objects.create(
+                            notification=notification,
+                            delivery_method='EMAIL',
+                            status='SENT',
+                            sent_at=timezone.now()
+                        )
+                        
+                        channel_results['email'] = True
+                    else:
+                        channel_results['email'] = False
+                        
+                except Exception as e:
+                    logger.error(f"Email failed for patient {patient_id}: {str(e)}")
+                    channel_results['email'] = False
+            
+            # In-App
+            if 'IN_APP' in send_via:
+                NotificationDelivery.objects.create(
+                    notification=notification,
+                    delivery_method='IN_APP',
+                    status='SENT',
+                    sent_at=timezone.now()
+                )
+                channel_results['in_app'] = True
+            
+            successful.append({
+                'id': patient_id,
+                'notification_id': notification.notification_id,
+                'alert_id': alert.alert_id,
+                'channels': channel_results
+            })
             
         except Exception as e:
+            logger.error(f"Error sending alert to patient {patient_id}: {str(e)}")
             failed.append({'id': patient_id, 'reason': str(e)})
     
     logger.info(f"Bulk alerts sent by {request.user.username}: {len(successful)} successful, {len(failed)} failed")
@@ -1394,7 +1666,9 @@ def send_bulk_alerts(request):
         'message': f'Alerts sent to {len(successful)} patients',
         'data': {
             'successful': successful,
-            'failed': failed
+            'failed': failed,
+            'notifications_created': notifications_created,
+            'total_notifications': len(notifications_created)
         }
     })
 
@@ -1402,87 +1676,188 @@ def send_bulk_alerts(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def get_patient_alerts(request, patient_id):
-    """Get all alerts for a specific patient"""
+    """Get all alerts for a specific patient with notifications"""
     
     user = request.user
     
-    # Check permission
+    # For PATIENT users, find their actual patient_id from database
     if user.user_type == 'PATIENT':
-        # Patient can only see their own alerts
         try:
+            # Get the patient profile for this user
             patient_profile = PatientProfile.objects.get(user=user)
-            if patient_profile.patient_id != patient_id:
+            actual_patient_id = patient_profile.patient_id
+            
+            # Check if the requested patient_id matches their actual patient_id
+            if int(patient_id) != int(actual_patient_id):
                 return Response({
                     'success': False,
-                    'error': 'You can only view your own alerts'
+                    'error': f'You can only view your own alerts. Your patient_id is {actual_patient_id}',
+                    'your_patient_id': actual_patient_id,
+                    'requested_id': patient_id
                 }, status=status.HTTP_403_FORBIDDEN)
+                
         except PatientProfile.DoesNotExist:
             return Response({
                 'success': False,
-                'error': 'Patient profile not found'
+                'error': 'Patient profile not found for this user'
             }, status=status.HTTP_404_NOT_FOUND)
     
+    # For other roles (NURSE, DOCTOR, ADMIN), allow access
     elif user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
         return Response({
             'success': False,
             'error': 'Permission denied'
         }, status=status.HTTP_403_FORBIDDEN)
     
-    # Find patient
+    # Find patient medical record
     try:
-        patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
+        patient_medical = None
+        patient_user = None
         
+        # First try: patient_id might be the actual patient_id from PatientProfile
+        patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
+        
+        if patient_profile:
+            patient_medical = PatientMedicalRecord.objects.filter(patient=patient_profile).first()
+            patient_user = patient_profile.user
+        
+        # Second try: patient_id might be medical_record_id
         if not patient_medical:
-            patient_profile = PatientProfile.objects.filter(patient_id=patient_id).first()
-            if patient_profile:
-                patient_medical = PatientMedicalRecord.objects.get(patient=patient_profile)
+            patient_medical = PatientMedicalRecord.objects.filter(medical_record_id=patient_id).first()
+            if patient_medical and patient_medical.patient:
+                patient_user = patient_medical.patient.user
         
         if not patient_medical:
             return Response({
                 'success': False,
-                'error': 'Patient not found'
+                'error': f'Patient not found with identifier: {patient_id}'
             }, status=status.HTTP_404_NOT_FOUND)
-        
+            
     except Exception as e:
         return Response({
             'success': False,
             'error': str(e)
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    # Get alerts
+    # Get alerts - FIXED: Use filter normally
     alerts = Alert.objects.filter(patient=patient_medical).order_by('-created_at')
     
-    # Optional filters
+    # Get notifications - FIXED: Avoid complex filtering
+    # Get all notifications first, then filter in Python
+    all_notifications = Notification.objects.filter(
+        recipient=patient_user,
+        notification_type='ALERT'
+    ).select_related('related_alert').order_by('-created_at')
+    
+    # Apply filters in Python instead of database
+    notifications = []
+    for notif in all_notifications:
+        notifications.append(notif)
+    
+    # Optional filters - apply in Python
     status_filter = request.GET.get('status')
     if status_filter:
-        alerts = alerts.filter(status=status_filter)
+        if status_filter == 'READ':
+            alerts = [a for a in alerts if a.status != 'PENDING']
+            notifications = [n for n in notifications if n.is_read]
+        elif status_filter == 'UNREAD':
+            alerts = [a for a in alerts if a.status == 'PENDING']
+            notifications = [n for n in notifications if not n.is_read]
     
-    alert_type_filter = request.GET.get('type')
-    if alert_type_filter:
-        alerts = alerts.filter(alert_type=alert_type_filter)
+    alert_level_filter = request.GET.get('priority')
+    if alert_level_filter:
+        alerts = [a for a in alerts if a.alert_level == alert_level_filter]
+        notifications = [n for n in notifications if n.priority == alert_level_filter]
     
     # If patient is viewing, mark as read automatically
     if user.user_type == 'PATIENT':
-        for alert in alerts.filter(status='SENT'):
-            # Mark as delivered/read
-            alert.status = 'DELIVERED'
-            alert.delivered_at = timezone.now()
-            alert.save()
-            
-            recipient = alert.recipients.first()
-            if recipient:
-                recipient.status = 'DELIVERED'
-                recipient.delivered_at = timezone.now()
-                recipient.save()
+        # Update alerts - FIXED: Update one by one
+        for alert in alerts:
+            if hasattr(alert, 'status') and alert.status == 'PENDING':
+                alert.status = 'DELIVERED'
+                alert.acknowledged_at = timezone.now()
+                alert.save()
+        
+        # Update notifications - FIXED: Update one by one
+        for notification in notifications:
+            if not notification.is_read:
+                notification.is_read = True
+                notification.read_at = timezone.now()
+                notification.save()
+                
+                # Update delivery status
+                try:
+                    delivery = NotificationDelivery.objects.filter(
+                        notification=notification,
+                        delivery_method='IN_APP'
+                    ).first()
+                    if delivery:
+                        delivery.status = 'DELIVERED'
+                        delivery.delivered_at = timezone.now()
+                        delivery.save()
+                except:
+                    pass
     
-    from .serializers import AlertSerializer
-    serializer = AlertSerializer(alerts, many=True, context={'request': request})
+    # Combine data
+    combined_data = []
+    
+    # Add alerts
+    for alert in alerts:
+        # Find related notification
+        related_notification = None
+        for notif in notifications:
+            if notif.related_alert and notif.related_alert.alert_id == alert.alert_id:
+                related_notification = notif
+                break
+        
+        combined_data.append({
+            'type': 'alert',
+            'id': alert.alert_id,
+            'title': alert.title,
+            'message': alert.description,
+            'priority': alert.alert_level,
+            'status': alert.status,
+            'created_at': alert.created_at,
+            'read_at': alert.acknowledged_at,
+            'notification_id': related_notification.notification_id if related_notification else None,
+            'is_read': related_notification.is_read if related_notification else (alert.status != 'PENDING'),
+            'action_url': related_notification.action_url if related_notification else None
+        })
+    
+    # Add notifications without alerts
+    for notification in notifications:
+        if not notification.related_alert:
+            combined_data.append({
+                'type': 'notification',
+                'id': notification.notification_id,
+                'title': notification.title,
+                'message': notification.message,
+                'priority': notification.priority,
+                'status': 'READ' if notification.is_read else 'SENT',
+                'created_at': notification.created_at,
+                'read_at': notification.read_at,
+                'notification_id': notification.notification_id,
+                'is_read': notification.is_read,
+                'action_url': notification.action_url
+            })
+    
+    # Sort by created_at
+    combined_data.sort(key=lambda x: x['created_at'], reverse=True)
+    
+    # Calculate counts
+    total_unread = len([x for x in combined_data if not x.get('is_read', False)])
+    alerts_count = len([x for x in combined_data if x['type'] == 'alert'])
+    notifications_count = len([x for x in combined_data if x['type'] == 'notification'])
     
     return Response({
         'success': True,
-        'data': serializer.data,
-        'total': alerts.count(),
-        'unread': alerts.filter(status='SENT').count()
+        'data': combined_data,
+        'summary': {
+            'total': len(combined_data),
+            'unread': total_unread,
+            'alerts_count': alerts_count,
+            'notifications_count': notifications_count
+        }
     })
 
 
@@ -1494,51 +1869,69 @@ def mark_alert_read(request, alert_id):
     user = request.user
     
     try:
-        alert = Alert.objects.get(alert_id=alert_id)
+        alert = Alert.objects.select_related('patient__patient').get(alert_id=alert_id)
     except Alert.DoesNotExist:
         return Response({
             'success': False,
             'error': 'Alert not found'
         }, status=status.HTTP_404_NOT_FOUND)
     
-    # Check permission
+    # Check permission for PATIENT
     if user.user_type == 'PATIENT':
-        # Check if this alert belongs to this patient
         try:
             patient_profile = PatientProfile.objects.get(user=user)
-            if alert.patient.patient.patient_id != patient_profile.patient_id:
+            alert_patient_id = alert.patient.patient.patient_id
+            
+            # This check is CORRECT - it prevents unauthorized access
+            if alert_patient_id != patient_profile.patient_id:
                 return Response({
                     'success': False,
-                    'error': 'This alert does not belong to you'
+                    'error': f'This alert does not belong to you'
                 }, status=status.HTTP_403_FORBIDDEN)
-        except:
+                
+        except PatientProfile.DoesNotExist:
             return Response({
                 'success': False,
                 'error': 'Patient profile not found'
             }, status=status.HTTP_404_NOT_FOUND)
     
-    # Mark as read
+    # For NURSE, DOCTOR, ADMIN - allow access
+    elif user.user_type not in ['NURSE', 'DOCTOR', 'ADMIN']:
+        return Response({
+            'success': False,
+            'error': 'Permission denied'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Mark alert as read
     alert.status = 'READ'
-    alert.read_at = timezone.now()
+    alert.acknowledged_at = timezone.now()
     alert.save()
     
-    # Update recipient
-    recipient = alert.recipients.first()
-    if recipient:
-        recipient.status = 'READ'
-        recipient.read_at = timezone.now()
-        recipient.save()
+    # Update notification if exists
+    try:
+        notification = Notification.objects.filter(related_alert=alert).first()
+        if notification:
+            notification.is_read = True
+            notification.read_at = timezone.now()
+            notification.save()
+    except Exception as e:
+        logger.warning(f"Error updating notification: {e}")
     
     return Response({
         'success': True,
-        'message': 'Alert marked as read'
+        'message': 'Alert marked as read',
+        'data': {
+            'alert_id': alert.alert_id,
+            'status': alert.status,
+            'acknowledged_at': alert.acknowledged_at
+        }
     })
 
 
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
 def delete_alert(request, alert_id):
-    """Delete an alert (admin only)"""
+    """Delete an alert and its related notifications (admin only)"""
     
     if request.user.user_type != 'ADMIN':
         return Response({
@@ -1548,13 +1941,24 @@ def delete_alert(request, alert_id):
     
     try:
         alert = Alert.objects.get(alert_id=alert_id)
+        
+        # Delete related notifications
+        notifications = Notification.objects.filter(related_alert=alert)
+        notifications_count = notifications.count()
+        notifications.delete()
+        
+        # Delete alert
         alert.delete()
         
-        logger.info(f"Alert {alert_id} deleted by admin {request.user.username}")
+        logger.info(f"Alert {alert_id} and {notifications_count} notifications deleted by admin {request.user.username}")
         
         return Response({
             'success': True,
-            'message': 'Alert deleted successfully'
+            'message': f'Alert and {notifications_count} notifications deleted successfully',
+            'data': {
+                'alert_id': alert_id,
+                'deleted_notifications': notifications_count
+            }
         })
         
     except Alert.DoesNotExist:
@@ -1563,56 +1967,3 @@ def delete_alert(request, alert_id):
             'error': 'Alert not found'
         }, status=status.HTTP_404_NOT_FOUND)
 
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def get_alert_templates(request):
-    """Get predefined alert templates"""
-    
-    templates = [
-        {
-            'id': 'medication_reminder',
-            'name': 'Medication Reminder',
-            'type': 'MEDICATION',
-            'priority': 'HIGH',
-            'title': 'Time for Medication',
-            'message': 'This is a reminder to take your medication as prescribed.'
-        },
-        {
-            'id': 'appointment_reminder',
-            'name': 'Appointment Reminder',
-            'type': 'APPOINTMENT',
-            'priority': 'MEDIUM',
-            'title': 'Upcoming Appointment',
-            'message': 'You have an appointment scheduled. Please be on time.'
-        },
-        {
-            'id': 'questionnaire_reminder',
-            'name': 'Questionnaire Reminder',
-            'type': 'QUESTIONNAIRE',
-            'priority': 'MEDIUM',
-            'title': 'Daily Questionnaire',
-            'message': 'Please complete your daily health questionnaire.'
-        },
-        {
-            'id': 'symptom_alert',
-            'name': 'Symptom Alert',
-            'type': 'SYMPTOM',
-            'priority': 'URGENT',
-            'title': 'Urgent: Report Symptoms',
-            'message': 'Please report any new or worsening symptoms immediately.'
-        },
-        {
-            'id': 'general_notice',
-            'name': 'General Notice',
-            'type': 'GENERAL',
-            'priority': 'LOW',
-            'title': 'Important Notice',
-            'message': 'Please check the app for important updates.'
-        }
-    ]
-    
-    return Response({
-        'success': True,
-        'data': templates
-    })

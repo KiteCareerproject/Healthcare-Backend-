@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import PatientAssignment, DashboardPreference, AnalyticsReport
 from accounts.serializers import NurseProfileSerializer, DoctorProfileSerializer, AdminProfileSerializer
 from patients.serializers import PatientMedicalRecordSerializer
-
+import uuid
 from accounts.models import User, NurseProfile, DoctorProfile, AdminProfile, PatientProfile
 from patients.models import PatientMedicalRecord, PatientProfile
 from django.contrib.auth.hashers import make_password
@@ -10,7 +10,12 @@ from django.db import transaction
 from datetime import datetime, timedelta
 from django.utils import timezone
 from monitoring.models import Alert
+from datetime import date
+from django.utils import timezone
+from decimal import Decimal
+from bson.decimal128 import Decimal128
 
+# ==================== USER SERIALIZER ====================
 class UserSerializer(serializers.ModelSerializer):
     id = serializers.IntegerField(read_only=True)
     email = serializers.EmailField(read_only=True)
@@ -28,449 +33,793 @@ class UserSerializer(serializers.ModelSerializer):
                  'date_of_birth', 'address', 'user_type', 'is_active']
         read_only_fields = ['id', 'user_type']
 
-# ==================== NURSE SERIALIZERS ====================
+# ==================== NURSE SERIALIZERS - ALL FIELDS ====================
 
 class NurseSerializer(serializers.ModelSerializer):
-    email = serializers.CharField(source='user.email', read_only=True)
-    full_name = serializers.SerializerMethodField()
-    is_active = serializers.BooleanField(source='user.is_active', read_only=True)
-
+    """Serializer for reading nurse data - ALL FIELDS"""
+    
     class Meta:
         model = NurseProfile
         fields = [
-            'nurse_id',
-            'user',
-            'full_name',
-            'first_name',
-            'last_name',
-            'email',
-            'employee_id',
-            'department',
-            'qualification',
-            'joining_date',
-            'created_at',
-            'updated_at',
-            'is_active'
+            'nurse_id', 'user',
+            'full_name', 'first_name', 'last_name', 'phone_number', 'email', 
+            'username', 'address', 'date_of_birth', 'aadhar_number', 'gender',
+            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            'employee_id', 'department', 'qualification', 'joining_date', 
+            'shift', 'employment_type', 'years_of_experience', 'is_active',
+            'skills', 'assigned_ward', 'supervisor',
+            'salary', 'bank_account_number', 'ifsc_code',
+            'blood_group',
+            'documents', 'profile_picture', 'uploaded_documents',
+            'created_at', 'updated_at'
         ]
         read_only_fields = ['nurse_id', 'created_at', 'updated_at']
     
-    def get_full_name(self, obj):
-        return f"{obj.first_name} {obj.last_name}"
+    def to_representation(self, instance):
+        """Manually control what data is returned"""
+        # Get the user instance
+        user = instance.user
+        
+        # ✅ Safe function to handle any file field
+        def safe_file_value(field):
+            """Safely get value from file field without causing ValueError"""
+            if field is None:
+                return None
+            try:
+                # Check if it's a FileField with URL attribute
+                if hasattr(field, 'url'):
+                    return field.url
+                # If it's already a string
+                elif isinstance(field, str):
+                    return field
+                # Try to convert to string
+                else:
+                    return str(field)
+            except (ValueError, AttributeError, TypeError):
+                return None
+        
+        # ✅ Safe function to handle documents (DictField)
+        def safe_documents_value(documents):
+            """Safely get documents value"""
+            if documents is None:
+                return {}
+            try:
+                if isinstance(documents, dict):
+                    return documents
+                elif isinstance(documents, str):
+                    try:
+                        import json
+                        return json.loads(documents)
+                    except:
+                        return {}
+                else:
+                    return {}
+            except:
+                return {}
+        
+        # ✅ Safe function to handle skills (ListField)
+        def safe_skills_value(skills):
+            """Safely get skills value"""
+            if skills is None:
+                return []
+            try:
+                if isinstance(skills, list):
+                    return skills
+                elif isinstance(skills, str):
+                    try:
+                        import json
+                        return json.loads(skills)
+                    except:
+                        return [s.strip() for s in skills.split(',') if s.strip()]
+                else:
+                    return []
+            except:
+                return []
+        
+        # ✅ Safe function to handle salary (DecimalField)
+        def safe_salary_value(salary):
+            """Safely get salary value as string"""
+            if salary is None:
+                return None
+            try:
+                if hasattr(salary, 'to_decimal'):
+                    return str(salary.to_decimal())
+                elif hasattr(salary, '__str__'):
+                    return str(salary)
+                else:
+                    return str(salary)
+            except:
+                return None
+        
+        # Get safe values for all file fields
+        profile_picture = safe_file_value(instance.profile_picture)
+        uploaded_documents = safe_file_value(instance.uploaded_documents)
+        documents = safe_documents_value(instance.documents)
+        skills = safe_skills_value(instance.skills)
+        salary = safe_salary_value(instance.salary)
+        
+        # Return the data as a dictionary
+        return {
+            # Primary Keys
+            'nurse_id': instance.nurse_id,
+            'user': instance.user_id,
+            
+            # Personal Information (from User model)
+            'full_name': f"{user.first_name} {user.last_name}".strip(),
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'phone_number': user.phone_number or "",
+            'email': user.email or "",
+            'username': user.username,
+            'is_active': user.is_active,
+            
+            # From NurseProfile
+            'address': instance.address if instance.address else "",
+            'date_of_birth': instance.date_of_birth if instance.date_of_birth else None,
+            'aadhar_number': instance.aadhar_number,
+            'gender': instance.gender,
+            
+            # Emergency Contact
+            'emergency_contact_name': instance.emergency_contact_name,
+            'emergency_contact_phone': instance.emergency_contact_phone,
+            'emergency_contact_relation': instance.emergency_contact_relation,
+            
+            # Employment Information
+            'employee_id': instance.employee_id,
+            'department': instance.department,
+            'qualification': instance.qualification,
+            'joining_date': instance.joining_date,
+            'shift': instance.shift,
+            'employment_type': instance.employment_type,
+            'years_of_experience': instance.years_of_experience,
+            
+            # Skills & Ward Assignment
+            'skills': skills,
+            'assigned_ward': instance.assigned_ward,
+            'supervisor': instance.supervisor,
+            
+            # Financial Information
+            'salary': salary,
+            'bank_account_number': instance.bank_account_number,
+            'ifsc_code': instance.ifsc_code,
+            
+            # Additional Fields
+            'blood_group': instance.blood_group,
+            
+            # Documents - Safe handling
+            'documents': documents,
+            'profile_picture': profile_picture,
+            'uploaded_documents': uploaded_documents,
+            
+            # Timestamps
+            'created_at': instance.created_at,
+            'updated_at': instance.updated_at,
+        }
 
-from rest_framework import serializers
-from accounts.models import User, NurseProfile
-from django.db import transaction
-import uuid
-from datetime import datetime
+# accounts/serializers.py
+
+# accounts/serializers.py
+
+import base64
+from django.core.files.base import ContentFile
 
 class NurseCreateSerializer(serializers.ModelSerializer):
-    # User-related fields
+    """Serializer for creating nurse - ALL FIELDS"""
+    
     email = serializers.EmailField(write_only=True)
     password = serializers.CharField(write_only=True, style={'input_type': 'password'})
-    first_name = serializers.CharField(write_only=True)
-    last_name = serializers.CharField(write_only=True)
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'}, required=False)
+    username = serializers.CharField(write_only=True, required=False)
     
-    # Optional fields
-    phone_number = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    date_of_birth = serializers.DateField(write_only=True, required=False, allow_null=True)
-    address = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    
-    # Employee ID - make it optional
-    employee_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    # ✅ Accept base64 string
+    profile_picture = serializers.CharField(
+        required=False, 
+        allow_null=True, 
+        allow_blank=True,
+        write_only=True
+    )
+    uploaded_documents = serializers.CharField(
+        required=False, 
+        allow_null=True, 
+        allow_blank=True,
+        write_only=True
+    )
     
     class Meta:
         model = NurseProfile
-        fields = [
-            # Don't include 'user' field here - remove it completely
-            'email', 'password', 'first_name', 'last_name',
-            'phone_number', 'date_of_birth', 'address',
-            'employee_id',  
-            'department',
-            'qualification',
-            'joining_date',  
-        ]
+        fields = '__all__'
+        read_only_fields = ['user', 'nurse_id', 'created_at', 'updated_at']
         extra_kwargs = {
-            # Remove 'user' from extra_kwargs
             'employee_id': {'required': False},
             'department': {'required': True},
             'qualification': {'required': True},
-            'joining_date': {'required': True},
+            'joining_date': {'required': False},
+            'years_of_experience': {'required': False, 'default': 0},
+            'skills': {'required': False, 'default': list},
+            'salary': {'required': False, 'allow_null': True},
+            'profile_picture': {'required': False, 'allow_null': True, 'allow_blank': True},
+            'uploaded_documents': {'required': False, 'allow_null': True, 'allow_blank': True},
+            'user': {'required': False},
         }
     
-    def generate_employee_id(self):
-        """Generate unique employee ID"""
-        # Try UUID based
-        for _ in range(5):
-            new_id = f"NUR{uuid.uuid4().hex[:6].upper()}"
-            if not NurseProfile.objects.filter(employee_id=new_id).exists():
-                return new_id
+    def validate_profile_picture(self, value):
+        """Validate and convert base64 to URL or store as base64"""
+        if value is None or value == '' or value == 'null':
+            return None
         
-        # Fallback to timestamp
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        new_id = f"NUR{timestamp}"
+        # ✅ If it's already a valid base64 string, return as is
+        if isinstance(value, str) and (value.startswith('data:image') or value.startswith('data:application')):
+            return value
         
-        # Ensure uniqueness
-        if NurseProfile.objects.filter(employee_id=new_id).exists():
-            new_id = f"NUR{timestamp}{uuid.uuid4().hex[:4].upper()}"
+        # ✅ If it's a URL, return as is
+        if isinstance(value, str) and value.startswith('http'):
+            return value
         
-        return new_id
+        return value
+    
+    def validate_uploaded_documents(self, value):
+        """Validate uploaded documents"""
+        if value is None or value == '' or value == 'null':
+            return None
+        return value
     
     def validate(self, data):
-        # CRITICAL: No 'user' field handling needed now
+        # Handle profile_picture
+        if data.get('profile_picture') in [None, '', 'null']:
+            data.pop('profile_picture', None)
         
-        # Handle employee_id
-        emp_id = data.get('employee_id')
+        if data.get('uploaded_documents') in [None, '', 'null']:
+            data.pop('uploaded_documents', None)
         
-        # Case 1: Empty string -> convert to None
-        if emp_id == '':
-            emp_id = None
-            data['employee_id'] = None
+        data.pop('user', None)
         
-        # Case 2: None -> generate new ID
-        if emp_id is None:
-            emp_id = self.generate_employee_id()
-            data['employee_id'] = emp_id
-            print(f" Generated employee_id: {emp_id}")
-        
-        # Case 3: Provided value -> check uniqueness
-        else:
-            if NurseProfile.objects.filter(employee_id=emp_id).exists():
-                raise serializers.ValidationError(
-                    {"employee_id": "Employee ID already exists"}
-                )
+        # Set default joining_date
+        if 'joining_date' not in data or not data['joining_date']:
+            from datetime import date
+            data['joining_date'] = date.today()
         
         # Password validation
         password = data.get('password')
-        if password and len(password) < 8:
-            raise serializers.ValidationError(
-                {"password": "Password must be at least 8 characters"}
-            )
+        confirm_password = data.get('confirm_password')
         
-        # Email validation
+        if password:
+            if password != confirm_password:
+                raise serializers.ValidationError({'confirm_password': 'Passwords do not match'})
+            if len(password) < 8:
+                raise serializers.ValidationError({'password': 'Password must be at least 8 characters'})
+        
+        # Employee ID
+        emp_id = data.get('employee_id')
+        if not emp_id:
+            data['employee_id'] = self.generate_employee_id()
+        
+        # Aadhar uniqueness
+        aadhar = data.get('aadhar_number')
+        if aadhar and NurseProfile.objects.filter(aadhar_number=aadhar).exists():
+            raise serializers.ValidationError({'aadhar_number': 'Aadhar number already exists'})
+        
+        # Email uniqueness
         email = data.get('email')
         if email and User.objects.filter(email=email).exists():
-            raise serializers.ValidationError(
-                {"email": "User with this email already exists"}
-            )
+            raise serializers.ValidationError({'email': 'Email already exists'})
         
         return data
     
+    def generate_employee_id(self):
+        import uuid
+        return f"NUR{uuid.uuid4().hex[:8].upper()}"
+    
     @transaction.atomic
     def create(self, validated_data):
-        # Extract user data
+        validated_data.pop('confirm_password', None)
+        
+        # ✅ Get profile_picture and uploaded_documents before popping
+        profile_picture = validated_data.pop('profile_picture', None)
+        uploaded_documents = validated_data.pop('uploaded_documents', None)
+        
         email = validated_data.pop('email')
         password = validated_data.pop('password')
-        first_name = validated_data.pop('first_name', '')
-        last_name = validated_data.pop('last_name', '')
+        username = validated_data.pop('username', None)
+        first_name = validated_data.pop('first_name')
+        last_name = validated_data.pop('last_name')
         phone_number = validated_data.pop('phone_number', '')
-        date_of_birth = validated_data.pop('date_of_birth', None)
-        address = validated_data.pop('address', '')
         
-        # Get employee_id (now guaranteed to have a value)
-        employee_id = validated_data.pop('employee_id')
+        if not username:
+            username = email.split('@')[0]
+            base_username = username
+            counter = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
         
-        # Create username from email
-        username = email.split('@')[0]
-        base_username = username
-        counter = 1
-        while User.objects.filter(username=username).exists():
-            username = f"{base_username}{counter}"
-            counter += 1
-        
-        # Create user
         user = User.objects.create_user(
             username=username,
             email=email,
             password=password,
             first_name=first_name,
-            last_name=last_name
+            last_name=last_name,
+            phone_number=phone_number,
+            user_type='NURSE'
         )
         
-        # Update user with additional fields
-        if hasattr(user, 'phone_number'):
-            user.phone_number = phone_number
-        if hasattr(user, 'date_of_birth'):
-            user.date_of_birth = date_of_birth
-        if hasattr(user, 'address'):
-            user.address = address
-        if hasattr(user, 'user_type'):
-            user.user_type = 'NURSE'
-        user.save()
-        
-        # Create nurse profile
+        # ✅ Create nurse with base64 strings directly
         nurse = NurseProfile.objects.create(
             user=user,
             first_name=first_name,
             last_name=last_name,
-            employee_id=employee_id,
-            department=validated_data.get('department'),
-            qualification=validated_data.get('qualification'),
-            joining_date=validated_data.get('joining_date')
+            email=user.email,                    
+            phone_number=user.phone_number, 
+            profile_picture=profile_picture,  # Store base64 string
+            uploaded_documents=uploaded_documents,  # Store base64 string
+            **validated_data
         )
         
         return nurse
 
+
 class NurseUpdateSerializer(serializers.ModelSerializer):
-    # Don't use source='user.field' - define fields normally
+    """Serializer for updating nurse - ALL FIELDS"""
+    # User fields that can be updated
+    email = serializers.EmailField(read_only=True)
+    username = serializers.CharField(read_only=True)
     first_name = serializers.CharField(required=False)
     last_name = serializers.CharField(required=False)
     phone_number = serializers.CharField(required=False, allow_blank=True)
-    email = serializers.EmailField(read_only=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     address = serializers.CharField(required=False, allow_blank=True)
-    is_active = serializers.BooleanField(required=False)
+    is_active = serializers.BooleanField(required=False, write_only=False)
     
     class Meta:
         model = NurseProfile
         fields = [
-            'first_name', 'last_name', 'phone_number', 'email', 
-            'date_of_birth', 'address',
+            # User fields
+            'email', 'username', 'first_name', 'last_name', 'phone_number',
+            'date_of_birth', 'address', 'is_active',
+            
+            # Personal Information
+            'aadhar_number', 'gender',
+            
+            # Emergency Contact
+            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            
+            # Employment Information
             'employee_id', 'department', 'qualification', 'joining_date',
-            'is_active'
+            'shift', 'employment_type', 'years_of_experience',
+            
+            # Skills & Ward Assignment
+            'skills', 'assigned_ward', 'supervisor',
+            
+            # Financial Information
+            'salary', 'bank_account_number', 'ifsc_code',
+            
+            # Additional Fields
+            'blood_group',
+            
+            # Documents
+            'documents', 'profile_picture', 'uploaded_documents'
+        ]
+        extra_kwargs = {
+            'employee_id': {'required': False, 'allow_blank': True},
+            'department': {'required': False, 'allow_blank': True},
+            'qualification': {'required': False, 'allow_blank': True},
+            'joining_date': {'required': False, 'allow_null': True},
+            'shift': {'required': False, 'allow_blank': True},
+            'employment_type': {'required': False, 'allow_blank': True},
+            'years_of_experience': {'required': False},
+            'skills': {'required': False},
+            'assigned_ward': {'required': False, 'allow_blank': True},
+            'supervisor': {'required': False, 'allow_blank': True},
+            'salary': {'required': False, 'allow_null': True},
+            'bank_account_number': {'required': False, 'allow_blank': True},
+            'ifsc_code': {'required': False, 'allow_blank': True},
+            'aadhar_number': {'required': False, 'allow_blank': True},
+            'gender': {'required': False, 'allow_blank': True},
+            'emergency_contact_name': {'required': False, 'allow_blank': True},
+            'emergency_contact_phone': {'required': False, 'allow_blank': True},
+            'emergency_contact_relation': {'required': False, 'allow_blank': True},
+            'blood_group': {'required': False, 'allow_blank': True},
+            'documents': {'required': False},
+            'profile_picture': {'required': False, 'allow_blank': True},
+            'uploaded_documents': {'required': False},
+        }
+    
+    # ✅ ADD THIS METHOD - Convert data before validation
+    def to_internal_value(self, data):
+        """Convert skills from string to list before validation"""
+        # Create a mutable copy of the data
+        mutable_data = data.copy() if hasattr(data, 'copy') else dict(data)
+        
+        # Handle skills conversion
+        if 'skills' in mutable_data and mutable_data['skills']:
+            skills_value = mutable_data['skills']
+            if isinstance(skills_value, str):
+                # Check if it's a comma-separated string
+                if ',' in skills_value:
+                    mutable_data['skills'] = [skill.strip() for skill in skills_value.split(',') if skill.strip()]
+                else:
+                    mutable_data['skills'] = [skills_value.strip()]
+            elif not isinstance(skills_value, list):
+                mutable_data['skills'] = []
+        
+        # Handle salary conversion
+        if 'salary' in mutable_data and mutable_data['salary']:
+            salary_value = mutable_data['salary']
+            if isinstance(salary_value, str):
+                try:
+                    mutable_data['salary'] = Decimal(salary_value.replace(',', ''))
+                except:
+                    pass
+        
+        # Handle years_of_experience conversion
+        if 'years_of_experience' in mutable_data and mutable_data['years_of_experience']:
+            exp_value = mutable_data['years_of_experience']
+            if isinstance(exp_value, str) and exp_value.isdigit():
+                mutable_data['years_of_experience'] = int(exp_value)
+        
+        # Call parent method with converted data
+        return super().to_internal_value(mutable_data)
+    
+    # ✅ KEEP THIS - Validate skills
+    def validate_skills(self, value):
+        """Convert skills from string to list if needed"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            if ',' in value:
+                return [skill.strip() for skill in value.split(',') if skill.strip()]
+            else:
+                return [value.strip()] if value.strip() else []
+        if not isinstance(value, list):
+            return []
+        return value
+    
+    def validate_salary(self, value):
+        """Convert salary from string/Decimal128 to Decimal"""
+        if value is None:
+            return None
+        
+        # If it's a string, convert to Decimal
+        if isinstance(value, str):
+            try:
+                # Remove any commas and convert
+                cleaned = value.replace(',', '')
+                return Decimal(cleaned)
+            except:
+                raise serializers.ValidationError("Salary must be a valid decimal number")
+        
+        # If it's Decimal128 (from MongoDB), convert to Decimal
+        if hasattr(value, 'to_decimal'):  # Handles Decimal128
+            return value.to_decimal()
+        
+        # If it's already Decimal, just pass through
+        if isinstance(value, Decimal):
+            return value
+        
+        # If it's int or float, convert to Decimal
+        if isinstance(value, (int, float)):
+            return Decimal(str(value))
+        
+        raise serializers.ValidationError("Salary must be a valid decimal number")
+    
+    def validate_years_of_experience(self, value):
+        """Validate years of experience"""
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            raise serializers.ValidationError("Years of experience must be a valid number")
+    
+    # ✅ UPDATE THIS - Ensure skills are saved as list
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        # ✅ Lock rows to prevent race conditions
+        user = User.objects.select_for_update().get(pk=instance.user.pk)
+        instance = self.Meta.model.objects.select_for_update().get(pk=instance.pk)
+        
+        # Store old values for audit
+        old_phone = user.phone_number
+        old_email = user.email
+        
+        # CRITICAL FIX: Convert instance's Decimal128 fields first
+        if isinstance(getattr(instance, 'salary', None), Decimal128):
+            instance.salary = instance.salary.to_decimal()
+        
+        # Update User model fields
+        user_fields = ['first_name', 'last_name', 'phone_number', 'email', 'is_active']
+        for field in user_fields:
+            if field in validated_data:
+                value = validated_data.pop(field)
+                if value is not None:
+                    # Check uniqueness
+                    if field in ['phone_number', 'email']:
+                        # Normalize phone number
+                        if field == 'phone_number' and value:
+                            import re
+                            value = re.sub(r'[\s\-\(\)\+]', '', value)
+                        
+                        existing = User.objects.filter(
+                            **{field: value}
+                        ).exclude(user_id=user.user_id).first()
+                        if existing:
+                            raise serializers.ValidationError({
+                                field: f"{field.replace('_', ' ').title()} '{value}' is already taken"
+                            })
+                    setattr(user, field, value)
+        
+        try:
+            user.full_clean()  # Validate user
+            user.save()
+        except Exception as e:
+            if 'duplicate key' in str(e) or '11000' in str(e):
+                raise serializers.ValidationError({
+                    'phone_number': 'This phone number is already registered to another user'
+                })
+            raise e
+        
+        # Update NurseProfile fields
+        for attr, value in validated_data.items():
+            if value is not None and hasattr(instance, attr):
+                # Convert Decimal128 to Decimal
+                if isinstance(value, Decimal128):
+                    value = value.to_decimal()
+                elif attr == 'salary':
+                    if isinstance(value, str):
+                        try:
+                            value = Decimal(value.replace(',', '').replace('$', ''))
+                        except (ValueError, TypeError):
+                            raise serializers.ValidationError({
+                                attr: f'Invalid salary format: {value}'
+                            })
+                elif attr == 'skills':
+                    if isinstance(value, str):
+                        value = [skill.strip() for skill in value.split(',') if skill.strip()] if value.strip() else []
+                    elif not isinstance(value, list):
+                        value = []
+                setattr(instance, attr, value)
+        
+        # Sync User fields to NurseProfile
+        instance.email = user.email
+        instance.phone_number = user.phone_number
+        
+        # Ensure fields are proper types
+        instance.skills = instance.skills or []
+        instance.documents = instance.documents or {}
+        
+        # Final safety check for Decimal128
+        if isinstance(getattr(instance, 'salary', None), Decimal128):
+            instance.salary = instance.salary.to_decimal()
+        
+        # Validate before saving
+        instance.full_clean()
+        instance.save()
+        instance.user.refresh_from_db()
+        
+        return instance
+
+# ==================== DOCTOR SERIALIZERS - ALL FIELDS ====================
+
+class DoctorSerializer(serializers.ModelSerializer):
+    """Serializer for reading doctor data - ALL FIELDS with License Fields"""
+    
+    email = serializers.EmailField(source='user.email', read_only=True)
+    username = serializers.CharField(source='user.username', read_only=True)
+    phone_number = serializers.CharField(source='user.phone_number', read_only=True, default='')
+    is_active = serializers.BooleanField(source='user.is_active', read_only=True)
+    first_name = serializers.CharField(source='user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.last_name', read_only=True)
+    full_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = DoctorProfile
+        fields = [
+            'doctor_id', 'user', 'full_name',
+            'first_name', 'last_name',
+            'phone_number', 'email', 'username', 'address', 'date_of_birth',
+            'aadhar_number', 'gender', 'is_active',
+            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            'employee_id', 'department', 'specialization', 'qualification',
+            'joining_date', 'shift', 'employment_type', 'years_of_experience',
+            'license_number', 'consultation_fee', 'available_days', 'available_time',
+            'skills', 'assigned_ward', 'supervisor',
+            'salary', 'bank_account_number', 'ifsc_code',
+            'blood_group',
+            'documents', 'profile_picture', 'uploaded_documents',
+            'state_of_licensure',      # ✅ ADDED
+            'license_expiry_date',     # ✅ ADDED
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['doctor_id', 'created_at', 'updated_at']
+    
+    def get_full_name(self, obj):
+        return f"Dr. {obj.user.first_name} {obj.user.last_name}"
+    
+    def to_representation(self, instance):
+        """Safely serialize doctor data with license fields"""
+        user = instance.user
+        
+        def safe_value(field):
+            if field is None:
+                return None
+            try:
+                if hasattr(field, 'url'):
+                    return field.url
+                elif isinstance(field, str):
+                    return field
+                else:
+                    return str(field)
+            except (ValueError, AttributeError):
+                return str(field) if field else None
+        
+        return {
+            'doctor_id': instance.doctor_id,
+            'user': instance.user_id,
+            'full_name': f"Dr. {user.first_name} {user.last_name}".strip(),
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            'phone_number': user.phone_number or "",
+            'email': user.email or "",
+            'username': user.username,
+            'is_active': user.is_active,
+            'address': instance.address or "",
+            'date_of_birth': instance.date_of_birth,
+            'aadhar_number': instance.aadhar_number,
+            'gender': instance.gender,
+            'emergency_contact_name': instance.emergency_contact_name,
+            'emergency_contact_phone': instance.emergency_contact_phone,
+            'emergency_contact_relation': instance.emergency_contact_relation,
+            'employee_id': instance.employee_id,
+            'department': instance.department,
+            'specialization': instance.specialization,
+            'qualification': instance.qualification,
+            'joining_date': instance.joining_date,
+            'shift': instance.shift,
+            'employment_type': instance.employment_type,
+            'years_of_experience': instance.years_of_experience,
+            'license_number': instance.license_number,
+            'consultation_fee': str(instance.consultation_fee) if instance.consultation_fee else None,
+            'available_days': instance.available_days if isinstance(instance.available_days, list) else [],
+            'available_time': instance.available_time if isinstance(instance.available_time, dict) else {},
+            'skills': instance.skills if isinstance(instance.skills, list) else [],
+            'assigned_ward': instance.assigned_ward,
+            'supervisor': instance.supervisor,
+            'salary': str(instance.salary) if instance.salary else None,
+            'bank_account_number': instance.bank_account_number,
+            'ifsc_code': instance.ifsc_code,
+            'blood_group': instance.blood_group,
+            'documents': instance.documents if isinstance(instance.documents, dict) else {},
+            'profile_picture': safe_value(instance.profile_picture),
+            'uploaded_documents': safe_value(instance.uploaded_documents),
+            'state_of_licensure': instance.state_of_licensure or "",      # ✅ ADDED
+            'license_expiry_date': instance.license_expiry_date,          # ✅ ADDED
+            'created_at': instance.created_at,
+            'updated_at': instance.updated_at,
+        }
+
+
+class DoctorCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating doctor - WITH LICENSE FIELDS"""
+    
+    email = serializers.EmailField(write_only=True)
+    password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    username = serializers.CharField(write_only=True, required=False)
+    
+    class Meta:
+        model = DoctorProfile
+        fields = [
+            'email', 'password', 'confirm_password', 'username',
+            'first_name', 'last_name', 'phone_number', 'address',
+            'date_of_birth', 'aadhar_number', 'gender',
+            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            'employee_id', 'department', 'specialization', 'qualification',
+            'joining_date', 'shift', 'employment_type', 'years_of_experience',
+            'license_number', 'consultation_fee', 'available_days', 'available_time',
+            'state_of_licensure',      # ✅ ADDED
+            'license_expiry_date',     # ✅ ADDED
+            'skills', 'assigned_ward', 'supervisor',
+            'salary', 'bank_account_number', 'ifsc_code',
+            'blood_group',
+            'documents', 'profile_picture', 'uploaded_documents'
         ]
         extra_kwargs = {
             'employee_id': {'required': False},
-            'department': {'required': False},
-            'qualification': {'required': False},
-            'joining_date': {'required': False},
-        }
-    
-    @transaction.atomic
-    def update(self, instance, validated_data):
-        # Update user fields
-        user = instance.user
-        
-        # Map of field names to update on user
-        user_field_mapping = {
-            'first_name': 'first_name',
-            'last_name': 'last_name',
-            'phone_number': 'phone_number',
-            'date_of_birth': 'date_of_birth',
-            'address': 'address',
-            'is_active': 'is_active'
-        }
-        
-        # Update user fields
-        user_updated = False
-        for serializer_field, user_field in user_field_mapping.items():
-            if serializer_field in validated_data:
-                value = validated_data.pop(serializer_field)
-                if value is not None:
-                    setattr(user, user_field, value)
-                    user_updated = True
-        
-        if user_updated:
-            user.save()
-        
-        # Update nurse profile with remaining fields
-        for attr, value in validated_data.items():
-            if value is not None and hasattr(instance, attr):
-                setattr(instance, attr, value)
-        
-        instance.save()
-        return instance
-
-# ==================== DOCTOR SERIALIZERS ====================
-
-class DoctorSerializer(serializers.ModelSerializer):
-    user = UserSerializer(read_only=True)
-    full_name = serializers.SerializerMethodField()
-    is_active = serializers.BooleanField(source='user.is_active', read_only=True)
-    
-    class Meta:
-        model = DoctorProfile
-        fields = [
-            'doctor_id', 
-            'user', 
-            'full_name', 
-            'first_name',
-            'last_name',
-            'license_number', 
-            'specialization', 
-            'qualification', 
-            # 'experience_years', 
-            # 'consultation_fee', 
-            'is_active', 
-            'joining_date'
-        ]
-        read_only_fields = ['doctor_id', 'joining_date']
-    
-    def get_full_name(self, obj):
-        return f"{obj.first_name} {obj.last_name}"
-
-class DoctorCreateSerializer(serializers.ModelSerializer):
-    email = serializers.EmailField(write_only=True)
-    password = serializers.CharField(write_only=True, style={'input_type': 'password'})
-    first_name = serializers.CharField(write_only=True)
-    last_name = serializers.CharField(write_only=True)
-    phone_number = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
-    date_of_birth = serializers.DateField(write_only=True, required=False, allow_null=True)
-    address = serializers.CharField(write_only=True, required=False, allow_blank=True)
-    employee_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)  # Make optional
-    
-    class Meta:
-        model = DoctorProfile
-        fields = [
-            'email', 'password', 'first_name', 'last_name', 
-            'phone_number', 'date_of_birth', 'address',
-            'employee_id',  # Include this
-            'license_number', 
-            'specialization', 
-            'qualification', 
-            'joining_date'
-        ]
-        extra_kwargs = {
-            'license_number': {'required': False},
-            'specialization': {'required': True},
+            'license_number': {'required': True},
             'qualification': {'required': True},
             'joining_date': {'required': True},
-            'employee_id': {'required': False},  # Not required
+            'years_of_experience': {'required': False, 'default': 0},
+            'state_of_licensure': {'required': False, 'allow_blank': True},      # ✅ ADDED
+            'license_expiry_date': {'required': False, 'allow_null': True},      # ✅ ADDED
         }
     
     def generate_employee_id(self):
-        """Generate unique employee ID"""
-        # Method 1: UUID based
         for _ in range(5):
-            new_id = f"DOC{uuid.uuid4().hex[:8].upper()}"
+            new_id = f"DOC{uuid.uuid4().hex[:6].upper()}"
             if not DoctorProfile.objects.filter(employee_id=new_id).exists():
                 return new_id
-        
-        # Method 2: Timestamp based
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        new_id = f"DOC{timestamp}"
-        
-        # Ensure uniqueness
-        if DoctorProfile.objects.filter(employee_id=new_id).exists():
-            new_id = f"DOC{timestamp}{uuid.uuid4().hex[:4].upper()}"
-        
-        return new_id
+        return f"DOC{timestamp}{uuid.uuid4().hex[:4].upper()}"
     
     def validate(self, data):
-        errors = {}
-    # Handle employee_id (existing code)
+        if data['password'] != data['confirm_password']:
+            raise serializers.ValidationError({'confirm_password': 'Passwords do not match'})
+        
+        if len(data['password']) < 8:
+            raise serializers.ValidationError({'password': 'Password must be at least 8 characters'})
+        
+        phone_number = data.get('phone_number', '')
+        if phone_number and phone_number.strip():
+            if User.objects.filter(phone_number=phone_number).exists():
+                raise serializers.ValidationError({
+                    'phone_number': 'Phone number already registered. Please use a different number.'
+                })
+        
+        license_num = data.get('license_number')
+        if DoctorProfile.objects.filter(license_number=license_num).exists():
+            raise serializers.ValidationError({'license_number': 'License number already exists'})
+        
         emp_id = data.get('employee_id')
-        if emp_id is None or emp_id == '':
-            emp_id = self.generate_employee_id()
-            data['employee_id'] = emp_id
-            print(f" Generated employee_id: {emp_id}")
-        else:
-            if DoctorProfile.objects.filter(employee_id=emp_id).exists():
-                raise serializers.ValidationError(
-                    {"employee_id": "Employee ID already exists"}
-                )
-            
-        license_no = data.get('license_number')
-        if not license_no or license_no == '':
-            # Don't save as null - generate a placeholder or make it optional
-            # Option 1: Generate temporary license number
-            import uuid
-            data['license_number'] = f"TEMP{uuid.uuid4().hex[:8].upper()}"
-            print(f" Generated temporary license: {data['license_number']}")
-            
-            # Option 2: Set to None but model must allow null
-            # data['license_number'] = None  # Only if model allows null
-        else:
-            if DoctorProfile.objects.filter(license_number=license_no).exists():
-                errors['license_number'] = "License number already exists"
-            # Password validation
-            password = data.get('password')
-            if not password or len(password) < 8:
-                raise serializers.ValidationError(
-                    {"password": "Password must be at least 8 characters"}
-                )
+        if emp_id == '' or emp_id is None:
+            data['employee_id'] = self.generate_employee_id()
+        elif DoctorProfile.objects.filter(employee_id=emp_id).exists():
+            raise serializers.ValidationError({'employee_id': 'Employee ID already exists'})
         
-        # Email validation
-        email = data.get('email')
-        if email and User.objects.filter(email=email).exists():
-            raise serializers.ValidationError(
-                {"email": "User with this email already exists"}
-            )
+        aadhar = data.get('aadhar_number')
+        if aadhar and DoctorProfile.objects.filter(aadhar_number=aadhar).exists():
+            raise serializers.ValidationError({'aadhar_number': 'Aadhar number already exists'})
         
-        # PHONE NUMBER VALIDATION - FIX THIS
-        phone = data.get('phone_number')
-        if phone:
-            # Remove if empty string
-            if phone == '':
-                data['phone_number'] = None
-            else:
-                # Check if phone number already exists
-                if User.objects.filter(phone_number=phone).exists():
-                    raise serializers.ValidationError(
-                        {"phone_number": "Phone number already exists"}
-                    )
-        
-        # License validation
-        license_no = data.get('license_number')
-        if license_no and DoctorProfile.objects.filter(license_number=license_no).exists():
-            raise serializers.ValidationError(
-                {"license_number": "License number already exists"}
-            )
+        if User.objects.filter(email=data['email']).exists():
+            raise serializers.ValidationError({'email': 'Email already exists'})
         
         return data
     
     @transaction.atomic
     def create(self, validated_data):
-        # Extract user data
+        validated_data.pop('confirm_password')
+        
         email = validated_data.pop('email')
         password = validated_data.pop('password')
-        first_name = validated_data.pop('first_name', '')
-        last_name = validated_data.pop('last_name', '')
-        phone_number = validated_data.pop('phone_number', None)
-        date_of_birth = validated_data.pop('date_of_birth', None)
-        address = validated_data.pop('address', '')
+        username = validated_data.pop('username', None)
+        first_name = validated_data.pop('first_name')
+        last_name = validated_data.pop('last_name')
+        phone_number = validated_data.pop('phone_number', '')
         
-        # Get employee_id (will be None if not provided)
-        employee_id = validated_data.pop('employee_id')
+        if not username:
+            username = email.split('@')[0]
+            base_username = username
+            counter = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
         
-        # Create username from email
-        username = email.split('@')[0]
-        base_username = username
-        counter = 1
-        while User.objects.filter(username=username).exists():
-            username = f"{base_username}{counter}"
-            counter += 1
-        
-        # Create user
         user = User.objects.create_user(
             username=username,
             email=email,
             password=password,
             first_name=first_name,
-            last_name=last_name
+            last_name=last_name,
+            phone_number=phone_number,
+            user_type='DOCTOR'
         )
         
-        # Update user with additional fields
-        if hasattr(user, 'phone_number'):
-            user.phone_number = phone_number
-        if hasattr(user, 'date_of_birth'):
-            user.date_of_birth = date_of_birth
-        if hasattr(user, 'address'):
-            user.address = address
-        if hasattr(user, 'user_type'):
-            user.user_type = 'DOCTOR'
-        
-        user.save()
-        
-        # Create doctor profile
         doctor = DoctorProfile.objects.create(
             user=user,
             first_name=first_name,
             last_name=last_name,
-            employee_id=employee_id,  # This will be None if not provided
-            license_number=validated_data.get('license_number'),
-            specialization=validated_data.get('specialization'),
-            qualification=validated_data.get('qualification'),
-            joining_date=validated_data.get('joining_date')
+            **validated_data
         )
         
         return doctor
 
+
 class DoctorUpdateSerializer(serializers.ModelSerializer):
-    # User fields - FIXED: Don't use source='user.field' pattern
+    """Serializer for updating doctor - WITH LICENSE FIELDS"""
+    
+    email = serializers.EmailField(read_only=True)
+    username = serializers.CharField(read_only=True)
     first_name = serializers.CharField(required=False)
     last_name = serializers.CharField(required=False)
     phone_number = serializers.CharField(required=False, allow_blank=True)
-    email = serializers.EmailField(read_only=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     address = serializers.CharField(required=False, allow_blank=True)
     is_active = serializers.BooleanField(required=False)
@@ -478,50 +827,111 @@ class DoctorUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = DoctorProfile
         fields = [
-            'first_name', 'last_name', 'phone_number', 'email', 
-            'date_of_birth', 'address',
-            'license_number', 
-            'specialization', 
-            'qualification', 
-            # 'experience_years',  # REMOVED
-            # 'consultation_fee', 
-            'joining_date',
-            'is_active'
+            'email', 'username', 'first_name', 'last_name', 'phone_number',
+            'date_of_birth', 'address', 'is_active',
+            'aadhar_number', 'gender',
+            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            'employee_id', 'department', 'specialization', 'qualification',
+            'joining_date', 'shift', 'employment_type', 'years_of_experience',
+            'license_number', 'consultation_fee', 'available_days', 'available_time',
+            'state_of_licensure',      # ✅ ADDED
+            'license_expiry_date',     # ✅ ADDED
+            'skills', 'assigned_ward', 'supervisor',
+            'salary', 'bank_account_number', 'ifsc_code',
+            'blood_group',
+            'documents', 'profile_picture', 'uploaded_documents'
         ]
         extra_kwargs = {
-            'license_number': {'required': False},
-            'specialization': {'required': False},
-            'qualification': {'required': False},
-            'joining_date': {'required': False},
-            # 'consultation_fee': {'required': False},
+            'employee_id': {'required': False, 'allow_blank': True},
+            'department': {'required': False, 'allow_blank': True},
+            'specialization': {'required': False, 'allow_blank': True},
+            'qualification': {'required': False, 'allow_blank': True},
+            'joining_date': {'required': False, 'allow_null': True},
+            'shift': {'required': False, 'allow_blank': True},
+            'employment_type': {'required': False, 'allow_blank': True},
+            'years_of_experience': {'required': False},
+            'license_number': {'required': False, 'allow_blank': True},
+            'consultation_fee': {'required': False, 'allow_null': True},
+            'available_days': {'required': False},
+            'available_time': {'required': False},
+            'state_of_licensure': {'required': False, 'allow_blank': True},      # ✅ ADDED
+            'license_expiry_date': {'required': False, 'allow_null': True},      # ✅ ADDED
+            'skills': {'required': False},
+            'assigned_ward': {'required': False, 'allow_blank': True},
+            'supervisor': {'required': False, 'allow_blank': True},
+            'salary': {'required': False, 'allow_null': True},
+            'bank_account_number': {'required': False, 'allow_blank': True},
+            'ifsc_code': {'required': False, 'allow_blank': True},
+            'aadhar_number': {'required': False, 'allow_blank': True},
+            'gender': {'required': False, 'allow_blank': True},
+            'emergency_contact_name': {'required': False, 'allow_blank': True},
+            'emergency_contact_phone': {'required': False, 'allow_blank': True},
+            'emergency_contact_relation': {'required': False, 'allow_blank': True},
+            'blood_group': {'required': False, 'allow_blank': True},
+            'documents': {'required': False},
+            'profile_picture': {'required': False, 'allow_blank': True},
+            'uploaded_documents': {'required': False},
         }
+    
+    def validate_consultation_fee(self, value):
+        if value is None:
+            return None
+        if hasattr(value, 'to_decimal'):
+            return value.to_decimal()
+        if isinstance(value, str):
+            try:
+                from decimal import Decimal
+                return Decimal(value)
+            except:
+                raise serializers.ValidationError("Consultation fee must be a valid number")
+        return value
+    
+    def validate_salary(self, value):
+        if value is None:
+            return None
+        if hasattr(value, 'to_decimal'):
+            return value.to_decimal()
+        if isinstance(value, str):
+            try:
+                from decimal import Decimal
+                return Decimal(value)
+            except:
+                raise serializers.ValidationError("Salary must be a valid number")
+        return value
     
     @transaction.atomic
     def update(self, instance, validated_data):
-        # Update user fields
         user = instance.user
-        user_updated = False
         
-        # Map of fields that belong to User model
-        user_fields = ['first_name', 'last_name', 'phone_number', 
-                      'date_of_birth', 'address', 'is_active']
-        
+        user_fields = ['first_name', 'last_name', 'phone_number', 'is_active']
         for field in user_fields:
             if field in validated_data:
                 value = validated_data.pop(field)
                 if value is not None:
                     setattr(user, field, value)
-                    user_updated = True
         
-        if user_updated:
-            user.save()
+        if 'date_of_birth' in validated_data:
+            if hasattr(user, 'date_of_birth'):
+                user.date_of_birth = validated_data.pop('date_of_birth')
         
-        # Update doctor profile fields
+        if 'address' in validated_data:
+            if hasattr(user, 'address'):
+                user.address = validated_data.pop('address')
+        
+        user.save()
+        
         for attr, value in validated_data.items():
             if value is not None and hasattr(instance, attr):
                 setattr(instance, attr, value)
         
+        if hasattr(instance.consultation_fee, 'to_decimal'):
+            instance.consultation_fee = instance.consultation_fee.to_decimal()
+        if hasattr(instance.salary, 'to_decimal'):
+            instance.salary = instance.salary.to_decimal()
+        
         instance.save()
+        instance.user.refresh_from_db()
+        
         return instance
 
 # ==================== PATIENT SERIALIZERS ====================
@@ -533,12 +943,13 @@ class PatientSerializer(serializers.ModelSerializer):
     email = serializers.EmailField(source='user.email', read_only=True)
     phone_number = serializers.CharField(source='user.phone_number', read_only=True)
     is_active = serializers.BooleanField(source='user.is_active', read_only=True)
-
+    
     class Meta:
         model = PatientProfile
         fields = [
             'patient_id',
             'user',
+            'patient_no',
             'full_name',
             'first_name',
             'last_name',
@@ -547,6 +958,9 @@ class PatientSerializer(serializers.ModelSerializer):
             'date_of_birth',
             'age',
             'gender',
+            'blood_group',  
+            'marital_status',
+            'patient_status',  
             'address',
             'emergency_contact_name',
             'emergency_contact_phone',
@@ -573,10 +987,12 @@ class PatientSerializer(serializers.ModelSerializer):
             return age
         return None
 
+
 class PatientCreateSerializer(serializers.ModelSerializer):
     # User-related fields
     email = serializers.EmailField(write_only=True)
     password = serializers.CharField(write_only=True, style={'input_type': 'password'})
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})  # ADDED
     phone_number = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
     
     # Patient profile fields
@@ -584,6 +1000,20 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     last_name = serializers.CharField(write_only=True)
     date_of_birth = serializers.DateField(write_only=True, required=False, allow_null=True)
     gender = serializers.ChoiceField(write_only=True, choices=['MALE', 'FEMALE', 'OTHER'])
+    blood_group = serializers.ChoiceField(  # ADDED
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        choices=['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+    )
+    marital_status = serializers.ChoiceField(  # ADDED
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        choices=['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED']
+    )
     address = serializers.CharField(write_only=True, required=False, allow_blank=True)
     emergency_contact_name = serializers.CharField(write_only=True, required=False, allow_blank=True)
     emergency_contact_phone = serializers.CharField(write_only=True, required=False, allow_blank=True)
@@ -591,43 +1021,119 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     aadhar_number = serializers.CharField(write_only=True)
     profile_picture = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
     
+    # Read-only field for age (will be calculated)
+    age = serializers.IntegerField(read_only=True)
+    
     class Meta:
         model = PatientProfile
         fields = [
-            'email', 'password', 'phone_number',
+            'email', 'password', 'confirm_password', 'phone_number',  # Added confirm_password
             'first_name', 'last_name', 'date_of_birth', 'gender',
+            'blood_group', 'marital_status',  # ADDED
             'address', 'emergency_contact_name', 'emergency_contact_phone',
-            'emergency_contact_relation', 'aadhar_number', 'profile_picture'
+            'emergency_contact_relation', 'aadhar_number', 'profile_picture',
+            'age'
         ]
     
+    def calculate_age(self, birth_date):
+        """Calculate age from date of birth"""
+        if not birth_date:
+            return None
+        
+        today = date.today()
+        age = today.year - birth_date.year
+        
+        if (today.month, today.day) < (birth_date.month, birth_date.day):
+            age -= 1
+        
+        return age
+    
+    def validate_date_of_birth(self, value):
+        """Validate date of birth"""
+        if not value:
+            return value
+        
+        if value > date.today():
+            raise serializers.ValidationError("Date of birth cannot be in the future")
+        
+        age = self.calculate_age(value)
+        if age is not None and age < 1:
+            raise serializers.ValidationError("Patient must be at least 1 year old")
+        
+        if age is not None and age > 120:
+            raise serializers.ValidationError("Invalid date of birth - age cannot exceed 120 years")
+        
+        return value
+    
+    def generate_unique_phone(self):
+        """Generate a unique phone number"""
+        prefixes = ['987654', '998877', '912345', '900000', '888888', '777777']
+        import random
+        for _ in range(10):
+            prefix = random.choice(prefixes)
+            suffix = str(random.randint(1000, 9999))
+            phone = f"{prefix}{suffix}"
+            
+            if not User.objects.filter(phone_number=phone).exists():
+                return phone
+        
+        # Fallback to timestamp
+        return f"987654{datetime.now().strftime('%d%H%M%S')}"
+    
     def validate(self, data):
-        # Convert empty strings to None
-        if 'phone_number' in data and data['phone_number'] == '':
-            data['phone_number'] = None
+        # Validate confirm_password
+        password = data.get('password')
+        confirm_password = data.get('confirm_password')
+        
+        if password != confirm_password:
+            raise serializers.ValidationError({
+                'confirm_password': 'Password and Confirm Password do not match'
+            })
         
         # Password validation
         if len(data.get('password', '')) < 8:
             raise serializers.ValidationError({"password": "Password must be at least 8 characters"})
+        
+        # 🔴 FIX: Ensure phone_number is never null
+        phone_number = data.get('phone_number')
+        if not phone_number or phone_number == '' or phone_number is None:
+            phone_number = self.generate_unique_phone()
+            data['phone_number'] = phone_number
+            print(f"Generated phone number: {phone_number}")
         
         # Email validation
         email = data.get('email')
         if email and User.objects.filter(email=email).exists():
             raise serializers.ValidationError({"email": "User with this email already exists"})
         
-        # Phone number validation
+        # Phone number validation - ensure uniqueness
         phone = data.get('phone_number')
-        if phone and User.objects.filter(phone_number=phone).exists():
-            raise serializers.ValidationError({"phone_number": "Phone number already exists"})
+        if phone:
+            # Keep generating until unique
+            while User.objects.filter(phone_number=phone).exists():
+                phone = self.generate_unique_phone()
+                data['phone_number'] = phone
+                print(f"Regenerated phone number: {phone}")
         
         # Aadhar number validation
         aadhar = data.get('aadhar_number')
         if aadhar and PatientProfile.objects.filter(aadhar_number=aadhar).exists():
             raise serializers.ValidationError({"aadhar_number": "Aadhar number already exists"})
         
+        # Date of birth validation
+        dob = data.get('date_of_birth')
+        if dob:
+            age = self.calculate_age(dob)
+            if age is not None:
+                data['calculated_age'] = age
+        
         return data
     
     @transaction.atomic
     def create(self, validated_data):
+        # Remove confirm_password
+        validated_data.pop('confirm_password')
+        
         # Extract user data
         email = validated_data.pop('email')
         password = validated_data.pop('password')
@@ -638,6 +1144,8 @@ class PatientCreateSerializer(serializers.ModelSerializer):
         last_name = validated_data.pop('last_name')
         date_of_birth = validated_data.pop('date_of_birth', None)
         gender = validated_data.pop('gender')
+        blood_group = validated_data.pop('blood_group', None)  # ADDED
+        marital_status = validated_data.pop('marital_status', None)  # ADDED
         address = validated_data.pop('address', '')
         emergency_contact_name = validated_data.pop('emergency_contact_name', '')
         emergency_contact_phone = validated_data.pop('emergency_contact_phone', '')
@@ -645,8 +1153,16 @@ class PatientCreateSerializer(serializers.ModelSerializer):
         aadhar_number = validated_data.pop('aadhar_number')
         profile_picture = validated_data.pop('profile_picture', None)
         
+        # Remove calculated_age if present
+        validated_data.pop('calculated_age', None)
+        
         # Create username from email
         username = email.split('@')[0]
+        base_username = username
+        counter = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base_username}{counter}"
+            counter += 1
         
         # Create user
         user = User.objects.create_user(
@@ -664,13 +1180,15 @@ class PatientCreateSerializer(serializers.ModelSerializer):
             user.user_type = 'PATIENT'
         user.save()
         
-        # Create patient profile
+        # Create patient profile with all fields
         patient = PatientProfile.objects.create(
             user=user,
             first_name=first_name,
             last_name=last_name,
             date_of_birth=date_of_birth,
             gender=gender,
+            blood_group=blood_group,  # ADDED
+            marital_status=marital_status,  # ADDED
             address=address,
             emergency_contact_name=emergency_contact_name,
             emergency_contact_phone=emergency_contact_phone,
@@ -680,18 +1198,64 @@ class PatientCreateSerializer(serializers.ModelSerializer):
         )
         
         return patient
+    
+    def to_representation(self, instance):
+        """Add calculated age to response"""
+        representation = super().to_representation(instance)
+        if instance.date_of_birth:
+            representation['age'] = self.calculate_age(instance.date_of_birth)
+        else:
+            representation['age'] = None
+        return representation
+
+
+# patients/serializers.py
 
 class PatientUpdateSerializer(serializers.ModelSerializer):
     # User fields
     first_name = serializers.CharField(required=False)
     last_name = serializers.CharField(required=False)
     phone_number = serializers.CharField(required=False, allow_blank=True, allow_null=True)
-    email = serializers.EmailField(read_only=True)
+    email = serializers.EmailField(required=False)
     is_active = serializers.BooleanField(required=False)
     
     # Patient profile fields
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     gender = serializers.ChoiceField(required=False, choices=['MALE', 'FEMALE', 'OTHER'])
+    blood_group = serializers.ChoiceField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        choices=['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+    )
+    marital_status = serializers.ChoiceField(
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        choices=['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED']
+    )
+    patient_status = serializers.ChoiceField(
+        required=False,
+        allow_null=False,
+        choices=['active', 'inactive', 'recovered'],
+        default='active'
+    )
+    
+    # Status reason fields - ✅ Add allow_null=True
+    status_reason = serializers.ChoiceField(
+        required=False,
+        allow_null=True,
+        choices=['recovered', 'deceased', 'discontinued']
+    )
+    recovery_date = serializers.DateField(required=False, allow_null=True)
+    recovery_notes = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # ✅ Changed
+    death_date = serializers.DateField(required=False, allow_null=True)
+    death_cause = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # ✅ Changed
+    death_notes = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # ✅ Changed
+    discontinuation_date = serializers.DateField(required=False, allow_null=True)
+    discontinuation_reason = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # ✅ Changed
+    discontinuation_notes = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # ✅ Changed
+    
     address = serializers.CharField(required=False, allow_blank=True)
     emergency_contact_name = serializers.CharField(required=False, allow_blank=True)
     emergency_contact_phone = serializers.CharField(required=False, allow_blank=True)
@@ -703,27 +1267,84 @@ class PatientUpdateSerializer(serializers.ModelSerializer):
         model = PatientProfile
         fields = [
             'first_name', 'last_name', 'phone_number', 'email', 'is_active',
-            'date_of_birth', 'gender', 'address',
-            'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
+            'date_of_birth', 'gender', 'blood_group', 'marital_status', 'patient_status',
+            'status_reason', 'recovery_date', 'recovery_notes',
+            'death_date', 'death_cause', 'death_notes',
+            'discontinuation_date', 'discontinuation_reason', 'discontinuation_notes',
+            'address', 'emergency_contact_name', 'emergency_contact_phone', 'emergency_contact_relation',
             'aadhar_number', 'profile_picture'
         ]
+    
+    def validate_email(self, value):
+        """Validate email uniqueness"""
+        if value:
+            current_user = self.instance.user
+            if User.objects.filter(email=value).exclude(user_id=current_user.user_id).exists():
+                raise serializers.ValidationError("User with this email already exists")
+        return value
     
     def validate(self, data):
         # Convert empty phone to None
         if 'phone_number' in data and data['phone_number'] == '':
             data['phone_number'] = None
         
+        # Convert to lowercase for storage
+        if 'patient_status' in data and data['patient_status']:
+            data['patient_status'] = data['patient_status'].lower()
+        
+        # ✅ Handle null values - convert None to empty string for text fields
+        text_fields = ['recovery_notes', 'death_cause', 'death_notes', 
+                       'discontinuation_reason', 'discontinuation_notes']
+        for field in text_fields:
+            if field in data and data[field] is None:
+                data[field] = ''
+        
+        # Validate status reason when patient is inactive or recovered
+        patient_status = data.get('patient_status')
+        status_reason = data.get('status_reason')
+        
+        if patient_status in ['inactive', 'recovered']:
+            if not status_reason:
+                raise serializers.ValidationError({
+                    "status_reason": "Status reason is required when patient is inactive or recovered"
+                })
+            
+            # Validate based on reason
+            if status_reason == 'recovered':
+                if not data.get('recovery_date'):
+                    raise serializers.ValidationError({
+                        "recovery_date": "Recovery date is required for recovered patients"
+                    })
+            elif status_reason == 'deceased':
+                if not data.get('death_date'):
+                    raise serializers.ValidationError({
+                        "death_date": "Death date is required for deceased patients"
+                    })
+            elif status_reason == 'discontinued':
+                if not data.get('discontinuation_date'):
+                    raise serializers.ValidationError({
+                        "discontinuation_date": "Discontinuation date is required for discontinued treatment"
+                    })
+        
+        # Clear reason fields when reactivating
+        if patient_status == 'active':
+            data['status_reason'] = None
+            data['recovery_date'] = None
+            data['recovery_notes'] = ''
+            data['death_date'] = None
+            data['death_cause'] = ''
+            data['death_notes'] = ''
+            data['discontinuation_date'] = None
+            data['discontinuation_reason'] = ''
+            data['discontinuation_notes'] = ''
+        
         # Check phone number uniqueness if changed
         phone = data.get('phone_number')
         if phone:
-            # Get current user's primary key value
             current_user = self.instance.user
-            
-            # Dynamically get the primary key field name and value
             pk_name = current_user._meta.pk.name
             pk_value = getattr(current_user, pk_name)
             
-            # Check if phone exists excluding current user
             if User.objects.filter(phone_number=phone).exclude(**{pk_name: pk_value}).exists():
                 raise serializers.ValidationError({"phone_number": "Phone number already exists"})
         
@@ -740,7 +1361,7 @@ class PatientUpdateSerializer(serializers.ModelSerializer):
         user = instance.user
         user_updated = False
         
-        user_fields = ['first_name', 'last_name', 'phone_number', 'is_active']
+        user_fields = ['first_name', 'last_name', 'phone_number', 'is_active', 'email']
         for field in user_fields:
             if field in validated_data:
                 value = validated_data.pop(field)
@@ -756,9 +1377,12 @@ class PatientUpdateSerializer(serializers.ModelSerializer):
             if value is not None:
                 setattr(instance, attr, value)
         
+        # Ensure patient_status is never null
+        if not instance.patient_status:
+            instance.patient_status = 'active'
+        
         instance.save()
         return instance
-
 # ==================== ASSIGNMENT SERIALIZERS ====================
 
 class PatientAssignmentSerializer(serializers.ModelSerializer):

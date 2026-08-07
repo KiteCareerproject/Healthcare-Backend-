@@ -5,6 +5,9 @@ urlpatterns = [
     # Authentication
     path('register/', views.register, name='register'),
     path('login/', views.login, name='login'),
+    path('forgot-password/', views.forgot_password, name='forgot-password'),
+    path('verify-otp/', views.verify_otp, name='verify-otp'),
+    path('reset-password/', views.reset_password, name='reset-password'),
     path('refresh-token/', views.refresh_token, name='refresh_token'),
     path('logout/', views.logout, name='logout'),
     

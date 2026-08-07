@@ -1,6 +1,9 @@
 from djongo import models
 from patients.models import PatientMedicalRecord, CancerType
-from accounts.models import NurseProfile
+from accounts.models import NurseProfile, AdminProfile   
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 class QuestionCategory(models.Model):
     category_id = models.AutoField(primary_key=True)
@@ -95,3 +98,5 @@ class AssignedQuestion(models.Model):
     
     def __str__(self):
         return f"AssignedQuestion {self.assigned_question_id}"
+
+
