@@ -86,17 +86,28 @@ TEMPLATES = [
 WSGI_APPLICATION = 'cancer_monitoring.wsgi.application'
 
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'djongo',
+#         'NAME': config('DB_NAME', default='cancer_db'),
+#         'ENFORCE_SCHEMA': False,
+#         'CLIENT': {
+#             'host': config('DB_HOST', default='localhost'),
+#             'port': config('DB_PORT', default=27017, cast=int),
+#             'username': config('DB_USER', default=''),
+#             'password': config('DB_PASSWORD', default=''),
+#             'authSource': config('DB_AUTH_SOURCE', default='admin'),
+#         }
+#     }
+# }
+
 DATABASES = {
     'default': {
         'ENGINE': 'djongo',
-        'NAME': config('DB_NAME', default='cancer_db'),
+        'NAME': config('DB_NAME', default='healthcare'),
         'ENFORCE_SCHEMA': False,
         'CLIENT': {
-            'host': config('DB_HOST', default='localhost'),
-            'port': config('DB_PORT', default=27017, cast=int),
-            'username': config('DB_USER', default=''),
-            'password': config('DB_PASSWORD', default=''),
-            'authSource': config('DB_AUTH_SOURCE', default='admin'),
+            'host': config('MONGODB_URI'),
         }
     }
 }
