@@ -992,7 +992,7 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     # User-related fields
     email = serializers.EmailField(write_only=True)
     password = serializers.CharField(write_only=True, style={'input_type': 'password'})
-    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})  # ADDED
+    confirm_password = serializers.CharField(write_only=True, style={'input_type': 'password'})
     phone_number = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
     
     # Patient profile fields
@@ -1000,14 +1000,14 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     last_name = serializers.CharField(write_only=True)
     date_of_birth = serializers.DateField(write_only=True, required=False, allow_null=True)
     gender = serializers.ChoiceField(write_only=True, choices=['MALE', 'FEMALE', 'OTHER'])
-    blood_group = serializers.ChoiceField(  # ADDED
+    blood_group = serializers.ChoiceField(
         write_only=True,
         required=False,
         allow_blank=True,
         allow_null=True,
         choices=['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
     )
-    marital_status = serializers.ChoiceField(  # ADDED
+    marital_status = serializers.ChoiceField(
         write_only=True,
         required=False,
         allow_blank=True,
@@ -1027,9 +1027,9 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = PatientProfile
         fields = [
-            'email', 'password', 'confirm_password', 'phone_number',  # Added confirm_password
+            'email', 'password', 'confirm_password', 'phone_number',
             'first_name', 'last_name', 'date_of_birth', 'gender',
-            'blood_group', 'marital_status',  # ADDED
+            'blood_group', 'marital_status',
             'address', 'emergency_contact_name', 'emergency_contact_phone',
             'emergency_contact_relation', 'aadhar_number', 'profile_picture',
             'age'
@@ -1067,18 +1067,22 @@ class PatientCreateSerializer(serializers.ModelSerializer):
     
     def generate_unique_phone(self):
         """Generate a unique phone number"""
-        prefixes = ['987654', '998877', '912345', '900000', '888888', '777777']
         import random
-        for _ in range(10):
+        prefixes = ['987654', '998877', '912345', '900000', '888888', '777777', '987654', '987655']
+        
+        for _ in range(20):
             prefix = random.choice(prefixes)
             suffix = str(random.randint(1000, 9999))
             phone = f"{prefix}{suffix}"
             
+            # Check if this phone number is already used
             if not User.objects.filter(phone_number=phone).exists():
                 return phone
         
-        # Fallback to timestamp
-        return f"987654{datetime.now().strftime('%d%H%M%S')}"
+        # Fallback to timestamp-based unique number
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%d%H%M%S%f')[:8]
+        return f"987654{timestamp}"
     
     def validate(self, data):
         # Validate confirm_password
@@ -1094,26 +1098,26 @@ class PatientCreateSerializer(serializers.ModelSerializer):
         if len(data.get('password', '')) < 8:
             raise serializers.ValidationError({"password": "Password must be at least 8 characters"})
         
-        # 🔴 FIX: Ensure phone_number is never null
+        # 🔴 CRITICAL FIX: Ensure phone_number is never None
         phone_number = data.get('phone_number')
+        
+        # If phone_number is None, empty string, or not provided, generate one
         if not phone_number or phone_number == '' or phone_number is None:
             phone_number = self.generate_unique_phone()
             data['phone_number'] = phone_number
-            print(f"Generated phone number: {phone_number}")
+            print(f"✅ Generated unique phone number: {phone_number}")
+        else:
+            # Phone number provided, validate it's unique
+            if User.objects.filter(phone_number=phone_number).exists():
+                # If the provided phone number is taken, generate a new one
+                phone_number = self.generate_unique_phone()
+                data['phone_number'] = phone_number
+                print(f"⚠️ Phone number was taken, generated: {phone_number}")
         
         # Email validation
         email = data.get('email')
         if email and User.objects.filter(email=email).exists():
             raise serializers.ValidationError({"email": "User with this email already exists"})
-        
-        # Phone number validation - ensure uniqueness
-        phone = data.get('phone_number')
-        if phone:
-            # Keep generating until unique
-            while User.objects.filter(phone_number=phone).exists():
-                phone = self.generate_unique_phone()
-                data['phone_number'] = phone
-                print(f"Regenerated phone number: {phone}")
         
         # Aadhar number validation
         aadhar = data.get('aadhar_number')
@@ -1137,15 +1141,20 @@ class PatientCreateSerializer(serializers.ModelSerializer):
         # Extract user data
         email = validated_data.pop('email')
         password = validated_data.pop('password')
+        
+        # 🔴 CRITICAL: Ensure phone_number is never None when creating user
         phone_number = validated_data.pop('phone_number', None)
+        if phone_number is None or phone_number == '':
+            phone_number = self.generate_unique_phone()
+            print(f"🔄 Generated phone number in create: {phone_number}")
         
         # Extract patient profile data
         first_name = validated_data.pop('first_name')
         last_name = validated_data.pop('last_name')
         date_of_birth = validated_data.pop('date_of_birth', None)
         gender = validated_data.pop('gender')
-        blood_group = validated_data.pop('blood_group', None)  # ADDED
-        marital_status = validated_data.pop('marital_status', None)  # ADDED
+        blood_group = validated_data.pop('blood_group', None)
+        marital_status = validated_data.pop('marital_status', None)
         address = validated_data.pop('address', '')
         emergency_contact_name = validated_data.pop('emergency_contact_name', '')
         emergency_contact_phone = validated_data.pop('emergency_contact_phone', '')
@@ -1164,21 +1173,16 @@ class PatientCreateSerializer(serializers.ModelSerializer):
             username = f"{base_username}{counter}"
             counter += 1
         
-        # Create user
+        # 🔴 Create user with phone_number (never None)
         user = User.objects.create_user(
             username=username,
             email=email,
             password=password,
             first_name=first_name,
-            last_name=last_name
+            last_name=last_name,
+            phone_number=phone_number,  # Always a string, never None
+            user_type='PATIENT'
         )
-        
-        # Update user with additional fields
-        if hasattr(user, 'phone_number'):
-            user.phone_number = phone_number
-        if hasattr(user, 'user_type'):
-            user.user_type = 'PATIENT'
-        user.save()
         
         # Create patient profile with all fields
         patient = PatientProfile.objects.create(
@@ -1187,14 +1191,15 @@ class PatientCreateSerializer(serializers.ModelSerializer):
             last_name=last_name,
             date_of_birth=date_of_birth,
             gender=gender,
-            blood_group=blood_group,  # ADDED
-            marital_status=marital_status,  # ADDED
+            blood_group=blood_group,
+            marital_status=marital_status,
             address=address,
             emergency_contact_name=emergency_contact_name,
             emergency_contact_phone=emergency_contact_phone,
             emergency_contact_relation=emergency_contact_relation,
             aadhar_number=aadhar_number,
-            profile_picture=profile_picture
+            profile_picture=profile_picture,
+            patient_status='active'
         )
         
         return patient

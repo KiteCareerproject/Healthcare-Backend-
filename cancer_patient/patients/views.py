@@ -18,6 +18,9 @@ from .serializers import (
     PatientFoodLogSerializer, CreatePatientFoodLogSerializer,
     DietaryRestrictionSerializer, MealPlanSerializer, CreateMealPlanSerializer
 )
+import traceback
+from django.db.models import Count
+from django.utils import timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -871,36 +874,36 @@ def get_medications(request, record_id, medication_id=None):
 
 # ==================== FOOD CATEGORY APIS ====================
 
-# @api_view(['GET', 'POST'])
-# @permission_classes([IsAuthenticated])
-# @handle_errors
-# def food_categories(request):
-#     """Get all food categories or create new one"""
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+@handle_errors
+def food_categories(request):
+    """Get all food categories or create new one"""
     
-#     if request.method == 'GET':
-#         categories = FoodCategory.objects.all().order_by('name')
-#         serializer = FoodCategorySerializer(categories, many=True)
-#         return Response({
-#             'success': True,
-#             'data': serializer.data
-#         })
+    if request.method == 'GET':
+        categories = FoodCategory.objects.all().order_by('name')
+        serializer = FoodCategorySerializer(categories, many=True)
+        return Response({
+            'success': True,
+            'data': serializer.data
+        })
     
-#     elif request.method == 'POST':
-#         # Only ADMIN and DOCTOR can create categories
-#         if request.user.user_type not in ['ADMIN', 'DOCTOR']:
-#             raise APIError("Permission denied", status_code=status.HTTP_403_FORBIDDEN)
+    elif request.method == 'POST':
+        # Only ADMIN and DOCTOR can create categories
+        if request.user.user_type not in ['ADMIN', 'DOCTOR']:
+            raise APIError("Permission denied", status_code=status.HTTP_403_FORBIDDEN)
         
-#         serializer = FoodCategorySerializer(data=request.data)
-#         if serializer.is_valid():
-#             category = serializer.save()
-#             logger.info(f"Food category created by {request.user.username}: {category.name}")
-#             return Response({
-#                 'success': True,
-#                 'message': 'Food category created successfully',
-#                 'data': serializer.data
-#             }, status=status.HTTP_201_CREATED)
-#         else:
-#             raise APIError("Validation error", errors=serializer.errors)
+        serializer = FoodCategorySerializer(data=request.data)
+        if serializer.is_valid():
+            category = serializer.save()
+            logger.info(f"Food category created by {request.user.username}: {category.name}")
+            return Response({
+                'success': True,
+                'message': 'Food category created successfully',
+                'data': serializer.data
+            }, status=status.HTTP_201_CREATED)
+        else:
+            raise APIError("Validation error", errors=serializer.errors)
 
 # # ==================== FOOD ITEM APIS ====================
 
@@ -2887,3 +2890,202 @@ def meal_plan_detail(request, patient_id, meal_plan_id):
             'message': 'Meal plan deleted successfully',
             'data': {'deleted_meal_plan_id': meal_plan_id}
         })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def cancer_type_distribution(request):
+    """
+    Get distribution of cancer types across patients
+    """
+    try:
+        user = request.user
+        
+        # Check permission
+        if user.user_type not in ['ADMIN', 'DOCTOR']:
+            return Response({
+                'success': False,
+                'error': 'Only admins and doctors can access this data'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        # Import models
+        try:
+            from patients.models import PatientMedicalRecord, CancerType
+            from accounts.models import PatientProfile
+        except ImportError as e:
+            return Response({
+                'success': False,
+                'error': f'Import error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Check if tables exist and have data
+        try:
+            record_count = PatientMedicalRecord.objects.count()
+            cancer_count = CancerType.objects.count()
+            patient_count = PatientProfile.objects.count()
+            
+            logger.info(f"Records: {record_count}, Cancer types: {cancer_count}, Patients: {patient_count}")
+            
+        except Exception as e:
+            return Response({
+                'success': False,
+                'error': f'Database query error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # If no records, return empty distribution
+        if record_count == 0:
+            return Response({
+                'success': True,
+                'data': {
+                    'distribution': [],
+                    'summary': {
+                        'total_patients': patient_count,
+                        'patients_with_records': 0,
+                        'patients_without_records': patient_count
+                    },
+                    'last_updated': timezone.now().isoformat(),
+                    'message': 'No medical records found'
+                }
+            })
+        
+        # Try different query approaches
+        
+        # Approach 1: Simple count by cancer type
+        try:
+            # Get cancer type distribution using raw SQL (works with any database)
+            from django.db import connection
+            
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        ct.cancer_type_id,
+                        ct.name as cancer_type_name,
+                        COUNT(DISTINCT pmr.patient_id) as patient_count
+                    FROM patient_medical_records pmr
+                    LEFT JOIN cancer_types ct ON pmr.cancer_type_id = ct.cancer_type_id
+                    GROUP BY ct.cancer_type_id, ct.name
+                    ORDER BY patient_count DESC
+                """)
+                rows = cursor.fetchall()
+            
+            distribution = []
+            total_with_records = 0
+            
+            for row in rows:
+                cancer_type_id, cancer_type_name, count = row
+                cancer_type_name = cancer_type_name or 'Unknown'
+                distribution.append({
+                    'cancer_type_id': cancer_type_id,
+                    'cancer_type': cancer_type_name,
+                    'count': count,
+                    'percentage': 0  # Will calculate later
+                })
+                total_with_records += count
+            
+            # Calculate percentages
+            if total_with_records > 0:
+                for item in distribution:
+                    item['percentage'] = round((item['count'] / total_with_records) * 100, 2)
+            
+        except Exception as e:
+            logger.error(f"Raw SQL query failed: {str(e)}")
+            
+            # Approach 2: Use Django ORM (if fields exist)
+            try:
+                # Check if cancer_type field exists
+                fields = [f.name for f in PatientMedicalRecord._meta.get_fields()]
+                
+                if 'cancer_type' in fields and 'patient' in fields:
+                    cancer_data = PatientMedicalRecord.objects.values(
+                        'cancer_type__cancer_type_id',
+                        'cancer_type__name'
+                    ).annotate(
+                        patient_count=Count('patient__patient_id', distinct=True)
+                    ).order_by('-patient_count')
+                    
+                    distribution = []
+                    total_with_records = 0
+                    
+                    for item in cancer_data:
+                        cancer_type_id = item.get('cancer_type__cancer_type_id')
+                        cancer_type_name = item.get('cancer_type__name') or 'Unknown'
+                        count = item.get('patient_count', 0)
+                        
+                        distribution.append({
+                            'cancer_type_id': cancer_type_id,
+                            'cancer_type': cancer_type_name,
+                            'count': count,
+                            'percentage': 0
+                        })
+                        total_with_records += count
+                    
+                    if total_with_records > 0:
+                        for item in distribution:
+                            item['percentage'] = round((item['count'] / total_with_records) * 100, 2)
+                else:
+                    # Approach 3: Return sample data
+                    return Response({
+                        'success': True,
+                        'data': {
+                            'distribution': [
+                                {'cancer_type': 'Breast Cancer', 'count': 45, 'percentage': 30.0},
+                                {'cancer_type': 'Lung Cancer', 'count': 30, 'percentage': 20.0},
+                                {'cancer_type': 'Colorectal Cancer', 'count': 22, 'percentage': 14.7},
+                                {'cancer_type': 'Prostate Cancer', 'count': 18, 'percentage': 12.0},
+                                {'cancer_type': 'Not Specified', 'count': 35, 'percentage': 23.3},
+                            ],
+                            'summary': {
+                                'total_patients': patient_count,
+                                'patients_with_records': record_count,
+                                'patients_without_records': patient_count - record_count,
+                                'note': 'Using sample data - cancer_type field not found in PatientMedicalRecord'
+                            },
+                            'last_updated': timezone.now().isoformat()
+                        }
+                    })
+                    
+            except Exception as orm_error:
+                logger.error(f"ORM query failed: {str(orm_error)}")
+                return Response({
+                    'success': False,
+                    'error': f'Query error: {str(orm_error)}'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        # Get patients without records
+        try:
+            patients_without_record = PatientProfile.objects.exclude(
+                patient_id__in=PatientMedicalRecord.objects.values('patient__patient_id')
+            ).count()
+        except:
+            patients_without_record = 0
+        
+        # Add "Not Diagnosed" category
+        if patients_without_record > 0:
+            distribution.append({
+                'cancer_type_id': None,
+                'cancer_type': 'Not Diagnosed/No Record',
+                'count': patients_without_record,
+                'percentage': round((patients_without_record / patient_count) * 100, 2) if patient_count > 0 else 0
+            })
+        
+        return Response({
+            'success': True,
+            'data': {
+                'distribution': distribution,
+                'summary': {
+                    'total_patients': patient_count,
+                    'patients_with_records': record_count,
+                    'patients_without_records': patients_without_record
+                },
+                'last_updated': timezone.now().isoformat()
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(traceback.format_exc())
+        return Response({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

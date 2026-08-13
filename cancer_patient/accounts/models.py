@@ -43,7 +43,7 @@ class User(AbstractUser):
     
     user_id = models.AutoField(primary_key=True)
     user_type = models.CharField(max_length=10, choices=USER_TYPES)
-    phone_number = models.CharField(max_length=15, unique=True, null=True, blank=True)
+    phone_number = models.CharField(max_length=15, null=True, blank=True)
     email = models.EmailField(unique=True)
     is_verified = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

@@ -15,6 +15,7 @@ urlpatterns = [
     path('medical-records/<int:record_id>/medications/<int:medication_id>/', views.get_medications, name='medications-detail'),
     
     # ==================== FOOD ITEM URLS ====================
+    path('food-categories/', views.food_categories, name='food_categories'),
     path('food-items/', views.food_items, name='food_items'),
     path('food-items/<int:item_id>/', views.food_item_detail, name='food_item_detail'),
     
@@ -32,4 +33,6 @@ urlpatterns = [
     
     # Meal Plans
     path('patients/<int:patient_id>/meal-plans/<int:meal_plan_id>/', views.meal_plan_detail, name='meal-plan-detail'),
+
+    path('cancer-type-distribution/', views.cancer_type_distribution, name='cancer-type-distribution'),
 ]
