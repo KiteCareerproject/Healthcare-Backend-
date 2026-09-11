@@ -66,13 +66,10 @@ class NurseSerializer(serializers.ModelSerializer):
             if field is None:
                 return None
             try:
-                # Check if it's a FileField with URL attribute
                 if hasattr(field, 'url'):
                     return field.url
-                # If it's already a string
                 elif isinstance(field, str):
                     return field
-                # Try to convert to string
                 else:
                     return str(field)
             except (ValueError, AttributeError, TypeError):
@@ -151,7 +148,9 @@ class NurseSerializer(serializers.ModelSerializer):
             'phone_number': user.phone_number or "",
             'email': user.email or "",
             'username': user.username,
-            'is_active': user.is_active,
+            
+            # ✅ FIXED: is_active from NurseProfile (NOT User)
+            'is_active': getattr(instance, 'is_active', True),
             
             # From NurseProfile
             'address': instance.address if instance.address else "",
@@ -359,20 +358,21 @@ class NurseCreateSerializer(serializers.ModelSerializer):
 
 class NurseUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating nurse - ALL FIELDS"""
-    # User fields that can be updated
-    email = serializers.EmailField(read_only=True)
+    
+    # ✅ FIX: Make email writable (remove read_only=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
     username = serializers.CharField(read_only=True)
-    first_name = serializers.CharField(required=False)
-    last_name = serializers.CharField(required=False)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
     phone_number = serializers.CharField(required=False, allow_blank=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     address = serializers.CharField(required=False, allow_blank=True)
-    is_active = serializers.BooleanField(required=False, write_only=False)
+    is_active = serializers.BooleanField(required=False)
     
     class Meta:
         model = NurseProfile
         fields = [
-            # User fields
+            # User fields - ✅ email is now writable
             'email', 'username', 'first_name', 'last_name', 'phone_number',
             'date_of_birth', 'address', 'is_active',
             
@@ -423,17 +423,36 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
             'uploaded_documents': {'required': False},
         }
     
-    # ✅ ADD THIS METHOD - Convert data before validation
+    def validate_email(self, value):
+        """Validate email format and uniqueness"""
+        if value:
+            # Check if email is already taken by another user
+            existing = User.objects.filter(email=value).exclude(user_id=self.instance.user_id).first()
+            if existing:
+                raise serializers.ValidationError(f"Email '{value}' is already taken")
+        return value
+    
+    def validate_phone_number(self, value):
+        """Validate phone number format and uniqueness"""
+        if value:
+            # Remove any non-digit characters
+            import re
+            value = re.sub(r'[\s\-\(\)\+]', '', value)
+            
+            # Check if phone is already taken by another user
+            existing = User.objects.filter(phone_number=value).exclude(user_id=self.instance.user_id).first()
+            if existing:
+                raise serializers.ValidationError(f"Phone number '{value}' is already taken")
+        return value
+    
     def to_internal_value(self, data):
         """Convert skills from string to list before validation"""
-        # Create a mutable copy of the data
         mutable_data = data.copy() if hasattr(data, 'copy') else dict(data)
         
         # Handle skills conversion
         if 'skills' in mutable_data and mutable_data['skills']:
             skills_value = mutable_data['skills']
             if isinstance(skills_value, str):
-                # Check if it's a comma-separated string
                 if ',' in skills_value:
                     mutable_data['skills'] = [skill.strip() for skill in skills_value.split(',') if skill.strip()]
                 else:
@@ -446,6 +465,7 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
             salary_value = mutable_data['salary']
             if isinstance(salary_value, str):
                 try:
+                    from decimal import Decimal
                     mutable_data['salary'] = Decimal(salary_value.replace(',', ''))
                 except:
                     pass
@@ -456,10 +476,8 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
             if isinstance(exp_value, str) and exp_value.isdigit():
                 mutable_data['years_of_experience'] = int(exp_value)
         
-        # Call parent method with converted data
         return super().to_internal_value(mutable_data)
     
-    # ✅ KEEP THIS - Validate skills
     def validate_skills(self, value):
         """Convert skills from string to list if needed"""
         if value is None:
@@ -475,27 +493,25 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
     
     def validate_salary(self, value):
         """Convert salary from string/Decimal128 to Decimal"""
+        from decimal import Decimal
+        from bson import Decimal128
+        
         if value is None:
             return None
         
-        # If it's a string, convert to Decimal
         if isinstance(value, str):
             try:
-                # Remove any commas and convert
-                cleaned = value.replace(',', '')
+                cleaned = value.replace(',', '').replace('$', '')
                 return Decimal(cleaned)
             except:
                 raise serializers.ValidationError("Salary must be a valid decimal number")
         
-        # If it's Decimal128 (from MongoDB), convert to Decimal
-        if hasattr(value, 'to_decimal'):  # Handles Decimal128
+        if isinstance(value, Decimal128):
             return value.to_decimal()
         
-        # If it's already Decimal, just pass through
         if isinstance(value, Decimal):
             return value
         
-        # If it's int or float, convert to Decimal
         if isinstance(value, (int, float)):
             return Decimal(str(value))
         
@@ -510,34 +526,28 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
         except (ValueError, TypeError):
             raise serializers.ValidationError("Years of experience must be a valid number")
     
-    # ✅ UPDATE THIS - Ensure skills are saved as list
     @transaction.atomic
     def update(self, instance, validated_data):
-        # ✅ Lock rows to prevent race conditions
+        from bson import Decimal128
+        from decimal import Decimal
+        
+        # Lock rows to prevent race conditions
         user = User.objects.select_for_update().get(pk=instance.user.pk)
         instance = self.Meta.model.objects.select_for_update().get(pk=instance.pk)
         
-        # Store old values for audit
-        old_phone = user.phone_number
-        old_email = user.email
-        
-        # CRITICAL FIX: Convert instance's Decimal128 fields first
-        if isinstance(getattr(instance, 'salary', None), Decimal128):
-            instance.salary = instance.salary.to_decimal()
-        
-        # Update User model fields
-        user_fields = ['first_name', 'last_name', 'phone_number', 'email', 'is_active']
+        # ✅ Update User model fields (including email)
+        user_fields = ['first_name', 'last_name', 'phone_number', 'email']
         for field in user_fields:
             if field in validated_data:
                 value = validated_data.pop(field)
                 if value is not None:
-                    # Check uniqueness
-                    if field in ['phone_number', 'email']:
-                        # Normalize phone number
-                        if field == 'phone_number' and value:
-                            import re
-                            value = re.sub(r'[\s\-\(\)\+]', '', value)
-                        
+                    # Normalize phone number
+                    if field == 'phone_number' and value:
+                        import re
+                        value = re.sub(r'[\s\-\(\)\+]', '', value)
+                    
+                    # ✅ Check uniqueness for email and phone
+                    if field in ['email', 'phone_number']:
                         existing = User.objects.filter(
                             **{field: value}
                         ).exclude(user_id=user.user_id).first()
@@ -545,17 +555,30 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
                             raise serializers.ValidationError({
                                 field: f"{field.replace('_', ' ').title()} '{value}' is already taken"
                             })
+                    
                     setattr(user, field, value)
         
+        # ✅ Handle is_active separately - Update BOTH User AND NurseProfile
+        if 'is_active' in validated_data:
+            is_active_value = validated_data.pop('is_active')
+            # ✅ Update User
+            user.is_active = is_active_value
+            # ✅ Update NurseProfile
+            instance.is_active = is_active_value
+        
         try:
-            user.full_clean()  # Validate user
+            user.full_clean()
             user.save()
         except Exception as e:
             if 'duplicate key' in str(e) or '11000' in str(e):
                 raise serializers.ValidationError({
-                    'phone_number': 'This phone number is already registered to another user'
+                    'email': 'This email is already registered to another user'
                 })
             raise e
+        
+        # ✅ Sync email and phone to NurseProfile
+        instance.email = user.email
+        instance.phone_number = user.phone_number
         
         # Update NurseProfile fields
         for attr, value in validated_data.items():
@@ -578,10 +601,6 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
                         value = []
                 setattr(instance, attr, value)
         
-        # Sync User fields to NurseProfile
-        instance.email = user.email
-        instance.phone_number = user.phone_number
-        
         # Ensure fields are proper types
         instance.skills = instance.skills or []
         instance.documents = instance.documents or {}
@@ -590,7 +609,7 @@ class NurseUpdateSerializer(serializers.ModelSerializer):
         if isinstance(getattr(instance, 'salary', None), Decimal128):
             instance.salary = instance.salary.to_decimal()
         
-        # Validate before saving
+        # ✅ Validate before saving
         instance.full_clean()
         instance.save()
         instance.user.refresh_from_db()
@@ -625,8 +644,8 @@ class DoctorSerializer(serializers.ModelSerializer):
             'salary', 'bank_account_number', 'ifsc_code',
             'blood_group',
             'documents', 'profile_picture', 'uploaded_documents',
-            'state_of_licensure',      # ✅ ADDED
-            'license_expiry_date',     # ✅ ADDED
+            'state_of_licensure',
+            'license_expiry_date',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['doctor_id', 'created_at', 'updated_at']
@@ -690,8 +709,8 @@ class DoctorSerializer(serializers.ModelSerializer):
             'documents': instance.documents if isinstance(instance.documents, dict) else {},
             'profile_picture': safe_value(instance.profile_picture),
             'uploaded_documents': safe_value(instance.uploaded_documents),
-            'state_of_licensure': instance.state_of_licensure or "",      # ✅ ADDED
-            'license_expiry_date': instance.license_expiry_date,          # ✅ ADDED
+            'state_of_licensure': instance.state_of_licensure or "",
+            'license_expiry_date': instance.license_expiry_date,
             'created_at': instance.created_at,
             'updated_at': instance.updated_at,
         }
@@ -813,12 +832,13 @@ class DoctorCreateSerializer(serializers.ModelSerializer):
 
 
 class DoctorUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for updating doctor - WITH LICENSE FIELDS"""
+    """Serializer for updating doctor - WITH LICENSE FIELDS AND EMAIL"""
     
-    email = serializers.EmailField(read_only=True)
+    # ✅ email - writable now (not read_only)
+    email = serializers.EmailField(required=False, allow_blank=True)
     username = serializers.CharField(read_only=True)
-    first_name = serializers.CharField(required=False)
-    last_name = serializers.CharField(required=False)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
     phone_number = serializers.CharField(required=False, allow_blank=True)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     address = serializers.CharField(required=False, allow_blank=True)
@@ -834,8 +854,8 @@ class DoctorUpdateSerializer(serializers.ModelSerializer):
             'employee_id', 'department', 'specialization', 'qualification',
             'joining_date', 'shift', 'employment_type', 'years_of_experience',
             'license_number', 'consultation_fee', 'available_days', 'available_time',
-            'state_of_licensure',      # ✅ ADDED
-            'license_expiry_date',     # ✅ ADDED
+            'state_of_licensure',
+            'license_expiry_date',
             'skills', 'assigned_ward', 'supervisor',
             'salary', 'bank_account_number', 'ifsc_code',
             'blood_group',
@@ -854,8 +874,8 @@ class DoctorUpdateSerializer(serializers.ModelSerializer):
             'consultation_fee': {'required': False, 'allow_null': True},
             'available_days': {'required': False},
             'available_time': {'required': False},
-            'state_of_licensure': {'required': False, 'allow_blank': True},      # ✅ ADDED
-            'license_expiry_date': {'required': False, 'allow_null': True},      # ✅ ADDED
+            'state_of_licensure': {'required': False, 'allow_blank': True},
+            'license_expiry_date': {'required': False, 'allow_null': True},
             'skills': {'required': False},
             'assigned_ward': {'required': False, 'allow_blank': True},
             'supervisor': {'required': False, 'allow_blank': True},
@@ -899,11 +919,20 @@ class DoctorUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError("Salary must be a valid number")
         return value
     
+    def validate_email(self, value):
+        """Validate email format"""
+        if value and not isinstance(value, str):
+            return value
+        if value and '@' not in value:
+            raise serializers.ValidationError("Enter a valid email address")
+        return value
+    
     @transaction.atomic
     def update(self, instance, validated_data):
         user = instance.user
         
-        user_fields = ['first_name', 'last_name', 'phone_number', 'is_active']
+        # ✅ Update User fields (including email)
+        user_fields = ['first_name', 'last_name', 'phone_number', 'is_active', 'email']
         for field in user_fields:
             if field in validated_data:
                 value = validated_data.pop(field)

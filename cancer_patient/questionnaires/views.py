@@ -128,6 +128,8 @@ def question_detail(request, question_id):
             question.is_active = data['is_active']
         if 'options' in data:
             question.options = data['options']
+        if 'question_type' in data:  # Add this line
+            question.question_type = data['question_type']  # Add this line
         
         question.save()
         

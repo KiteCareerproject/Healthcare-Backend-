@@ -1906,15 +1906,56 @@ def handle_put_request(request, patient_id, item_id, user):
         
         if action == 'plans':
             item = PatientDietaryPlan.objects.get(plan_id=item_id, patient_id=patient_id)
+            # ✅ Handle food_item_name for plans
+            if 'food_item_name' in data:
+                try:
+                    food_item = FoodItem.objects.get(name__iexact=data['food_item_name'])
+                    data['food_item_id'] = food_item.food_item_id
+                except FoodItem.DoesNotExist:
+                    raise APIError(f"Food item '{data['food_item_name']}' not found", 
+                                 status_code=status.HTTP_404_NOT_FOUND)
             serializer = PatientDietaryPlanSerializer(item, data=data, partial=True)
+            
         elif action == 'logs':
             item = PatientFoodLog.objects.get(log_id=item_id, patient_id=patient_id)
+            # ✅ Handle food_item_name for logs
+            if 'food_item_name' in data:
+                try:
+                    food_item = FoodItem.objects.get(name__iexact=data['food_item_name'])
+                    data['food_item_id'] = food_item.food_item_id
+                except FoodItem.DoesNotExist:
+                    raise APIError(f"Food item '{data['food_item_name']}' not found", 
+                                 status_code=status.HTTP_404_NOT_FOUND)
             serializer = PatientFoodLogSerializer(item, data=data, partial=True)
+            
         elif action == 'restrictions':
             item = DietaryRestriction.objects.get(restriction_id=item_id, patient_id=patient_id)
+            # ✅ Handle food_item_name for restrictions
+            if 'food_item_name' in data:
+                try:
+                    food_item = FoodItem.objects.get(name__iexact=data['food_item_name'])
+                    data['food_item_id'] = food_item.food_item_id
+                except FoodItem.DoesNotExist:
+                    raise APIError(f"Food item '{data['food_item_name']}' not found", 
+                                 status_code=status.HTTP_404_NOT_FOUND)
             serializer = DietaryRestrictionSerializer(item, data=data, partial=True)
+            
         elif action == 'meal-plans':
             item = MealPlan.objects.get(meal_plan_id=item_id, patient_id=patient_id)
+            # ✅ Handle food_items names for meal plans
+            if 'food_items' in data and isinstance(data['food_items'], list):
+                new_food_items = []
+                for food in data['food_items']:
+                    if isinstance(food, str):
+                        try:
+                            food_item = FoodItem.objects.get(name__iexact=food)
+                            new_food_items.append(food_item.food_item_id)
+                        except FoodItem.DoesNotExist:
+                            raise APIError(f"Food item '{food}' not found", 
+                                         status_code=status.HTTP_404_NOT_FOUND)
+                    else:
+                        new_food_items.append(food)
+                data['food_items'] = new_food_items
             serializer = MealPlanSerializer(item, data=data, partial=True)
         else:
             raise APIError(f"Invalid action for update: {action}")
@@ -1944,7 +1985,7 @@ def handle_put_request(request, patient_id, item_id, user):
 
 
 def handle_delete_request(request, patient_id, item_id, user):
-    """Improved DELETE handler - distinguishes between different ID types"""
+    """Delete handler with support for food_item_name"""
     
     logger.info(f"DELETE handler - patient_id: {patient_id}, item_id from URL: {item_id}")
     
@@ -1971,11 +2012,11 @@ def handle_delete_request(request, patient_id, item_id, user):
     
     if not delete_item_id:
         raise APIError(
-            "item_id is required for delete. Please provide the LOG ID, not food_item_id",
+            "item_id is required for delete. Please provide the LOG ID",
             status_code=status.HTTP_400_BAD_REQUEST
         )
     
-    # Get action - IMPORTANT: This tells us what type of item we're deleting
+    # Get action
     action = request.query_params.get('action')
     
     if not action and request.body:
@@ -2000,26 +2041,36 @@ def handle_delete_request(request, patient_id, item_id, user):
     
     if not action:
         raise APIError(
-            "action is required. Use ?action=logs to delete a food log, "
-            "or ?action=plans to delete a dietary plan",
+            "action is required. Use ?action=logs to delete a food log",
             status_code=status.HTTP_400_BAD_REQUEST
         )
     
     logger.info(f"Deleting - action: {action}, item_id: {delete_item_id}, patient_id: {patient_id}")
     
     try:
-        if action == 'plans':
-            # delete_item_id here is plan_id (NOT food_item_id)
+        if action == 'logs':
+            # ✅ Support deleting by food_item_name
+            if 'food_item_name' in request.query_params:
+                food_item_name = request.query_params.get('food_item_name')
+                try:
+                    food_item = FoodItem.objects.get(name__iexact=food_item_name)
+                    item = PatientFoodLog.objects.get(
+                        patient_id=patient_id, 
+                        food_item=food_item
+                    )
+                except FoodItem.DoesNotExist:
+                    raise APIError(f"Food item '{food_item_name}' not found", status_code=404)
+                except PatientFoodLog.DoesNotExist:
+                    raise APIError(f"Food log for '{food_item_name}' not found", status_code=404)
+            else:
+                item = PatientFoodLog.objects.get(log_id=delete_item_id, patient_id=patient_id)
+            item.delete()
+            message = "Food log deleted successfully"
+            
+        elif action == 'plans':
             item = PatientDietaryPlan.objects.get(plan_id=delete_item_id, patient_id=patient_id)
             item.delete()
             message = "Dietary plan deleted successfully"
-            
-        elif action == 'logs':
-            # delete_item_id here is log_id (NOT food_item_id)
-            # You cannot delete a food log using food_item_id!
-            item = PatientFoodLog.objects.get(log_id=delete_item_id, patient_id=patient_id)
-            item.delete()
-            message = "Food log deleted successfully"
             
         elif action == 'restrictions':
             item = DietaryRestriction.objects.get(restriction_id=delete_item_id, patient_id=patient_id)
@@ -2045,12 +2096,9 @@ def handle_delete_request(request, patient_id, item_id, user):
         })
         
     except PatientDietaryPlan.DoesNotExist:
-        raise APIError(f"Dietary plan with id {delete_item_id} not found for patient {patient_id}. "
-                      f"Note: This is plan_id, not food_item_id", status_code=404)
+        raise APIError(f"Dietary plan with id {delete_item_id} not found", status_code=404)
     except PatientFoodLog.DoesNotExist:
-        raise APIError(f"Food log with id {delete_item_id} not found for patient {patient_id}. "
-                      f"Note: This is log_id, not food_item_id. "
-                      f"To delete a food log, you need the log_id from PatientFoodLog table", status_code=404)
+        raise APIError(f"Food log with id {delete_item_id} not found", status_code=404)
     except DietaryRestriction.DoesNotExist:
         raise APIError(f"Dietary restriction with id {delete_item_id} not found", status_code=404)
     except MealPlan.DoesNotExist:
@@ -2456,13 +2504,28 @@ def create_dietary_plan(request, patient, doctor, data):
 def create_food_log(request, patient, data):
     """Create a new food log"""
     try:
-        # Get food item
-        try:
-            food_item = FoodItem.objects.get(food_item_id=data['food_item_id'])
-        except FoodItem.DoesNotExist:
-            raise APIError("Food item not found", status_code=status.HTTP_404_NOT_FOUND)
-        except KeyError:
-            raise APIError("food_item_id is required", status_code=status.HTTP_400_BAD_REQUEST)
+        # ✅ Support both food_item_id and food_item_name
+        food_item = None
+        
+        if 'food_item_id' in data:
+            try:
+                food_item = FoodItem.objects.get(food_item_id=data['food_item_id'])
+            except FoodItem.DoesNotExist:
+                raise APIError("Food item not found", status_code=status.HTTP_404_NOT_FOUND)
+        elif 'food_item_name' in data:
+            try:
+                food_item = FoodItem.objects.get(name__iexact=data['food_item_name'])
+            except FoodItem.DoesNotExist:
+                # Try partial match
+                food_items = FoodItem.objects.filter(name__icontains=data['food_item_name'])
+                if food_items.exists():
+                    food_item = food_items.first()
+                else:
+                    raise APIError(f"Food item '{data['food_item_name']}' not found", 
+                                 status_code=status.HTTP_404_NOT_FOUND)
+        else:
+            raise APIError("Either food_item_id or food_item_name is required", 
+                         status_code=status.HTTP_400_BAD_REQUEST)
         
         # Handle consumed_at
         from django.utils import timezone
@@ -2473,7 +2536,6 @@ def create_food_log(request, patient, data):
             consumed_at = timezone.now()
         elif isinstance(consumed_at, str):
             try:
-                # Parse ISO format string
                 consumed_at = datetime.datetime.fromisoformat(consumed_at.replace('Z', '+00:00'))
             except:
                 consumed_at = timezone.now()
@@ -2498,12 +2560,9 @@ def create_food_log(request, patient, data):
             'data': PatientFoodLogSerializer(log).data
         }, status=status.HTTP_201_CREATED)
         
-    except KeyError as e:
-        raise APIError(f"Missing required field: {str(e)}", status_code=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         logger.error(f"Error creating food log: {str(e)}")
         raise APIError(f"Failed to create food log: {str(e)}", status_code=status.HTTP_400_BAD_REQUEST)
-
 
 def create_dietary_restriction(request, patient, data):
     """Create a new dietary restriction"""

@@ -171,14 +171,44 @@ class PatientFoodLogSerializer(serializers.ModelSerializer):
     patient_name = serializers.CharField(source='patient.user.get_full_name', read_only=True)
     food_item_name = serializers.CharField(source='food_item.name', read_only=True)
     
+    # ✅ Add food_item_id for write operations
+    food_item_id = serializers.IntegerField(write_only=True, required=False)
+    
     class Meta:
         model = PatientFoodLog
         fields = [
-            'log_id', 'patient', 'patient_name', 'food_item', 'food_item_name',
-            'meal_type', 'quantity_consumed', 'consumed_at', 'symptoms_experienced',
-            'symptom_severity', 'notes', 'created_at'
+            'log_id', 'patient', 'patient_name', 
+            'food_item', 'food_item_id', 'food_item_name',
+            'meal_type', 'quantity_consumed', 'consumed_at', 
+            'symptoms_experienced', 'symptom_severity', 'notes', 
+            'created_at'
         ]
-        read_only_fields = ['log_id', 'created_at']
+        read_only_fields = ['log_id', 'created_at', 'patient']
+    
+    def validate_food_item_id(self, value):
+        """Validate that food item exists"""
+        if value:
+            try:
+                FoodItem.objects.get(food_item_id=value)
+            except FoodItem.DoesNotExist:
+                raise serializers.ValidationError("Food item not found")
+        return value
+    
+    def create(self, validated_data):
+        """Handle food_item_id during create"""
+        food_item_id = validated_data.pop('food_item_id', None)
+        if food_item_id:
+            food_item = FoodItem.objects.get(food_item_id=food_item_id)
+            validated_data['food_item'] = food_item
+        return super().create(validated_data)
+    
+    def update(self, instance, validated_data):
+        """Handle food_item_id during update"""
+        food_item_id = validated_data.pop('food_item_id', None)
+        if food_item_id:
+            food_item = FoodItem.objects.get(food_item_id=food_item_id)
+            validated_data['food_item'] = food_item
+        return super().update(instance, validated_data)
 
 class CreatePatientFoodLogSerializer(serializers.Serializer):
     patient_id = serializers.IntegerField(required=False)

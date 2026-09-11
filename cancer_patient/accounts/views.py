@@ -498,47 +498,96 @@ def forgot_password(request):
     Send OTP to user's email for password reset
     Request body: {"email": "user@example.com"}
     """
-    email = request.data.get('email')
+    # ✅ Normalize email - remove spaces and convert to lowercase
+    email = request.data.get('email', '').strip().lower()
     
     if not email:
         raise APIError("Email is required", status_code=status.HTTP_400_BAD_REQUEST)
     
-    # Check if user exists with this email
-    try:
-        user = User.objects.get(email=email)
-    except User.DoesNotExist:
-        # Don't reveal that email doesn't exist for security
-        return Response({
-            'success': True,
-            'message': 'If an account exists with this email, you will receive an OTP'
-        })
+    # ✅ Validate email format
+    if '@' not in email or '.' not in email:
+        raise APIError("Please enter a valid email address", status_code=status.HTTP_400_BAD_REQUEST)
     
-    # Generate 6-digit OTP
+    # ✅ Log for debugging
+    logger.info(f"🔍 Password reset requested for email: {email}")
+    
+    # ✅ Check if user exists with this email (ONLY EXACT MATCH)
+    try:
+        # ✅ Use exact match - case sensitive
+        user = User.objects.get(email=email)
+        logger.info(f"✅ User found: {user.email}")
+    except User.DoesNotExist:
+        # ✅ Try case-insensitive match (for debugging)
+        user_case = User.objects.filter(email__iexact=email).first()
+        if user_case:
+            logger.warning(f"⚠️ User exists with different case: {user_case.email}")
+            raise APIError(
+                f"No account found with email '{email}'. Did you mean '{user_case.email}'?",
+                status_code=status.HTTP_404_NOT_FOUND
+            )
+        
+        # ✅ WRONG EMAIL - Return error
+        logger.warning(f"❌ User not found with email: {email}")
+        raise APIError(
+            "No account found with this email address. Please check and try again.",
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    
+    # ✅ Check if user is active
+    if not user.is_active:
+        logger.warning(f"⚠️ Inactive user: {email}")
+        raise APIError(
+            "Your account is inactive. Please contact support.",
+            status_code=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # ✅ Rate limiting
+    rate_limit_key = f"password_reset_rate_{email}"
+    rate_limit_count = cache.get(rate_limit_key, 0)
+    
+    if rate_limit_count >= 3:
+        raise APIError(
+            "Too many OTP requests. Please wait 15 minutes before trying again.",
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS
+        )
+    
+    # ✅ Generate OTP (Only for valid users)
     otp = ''.join(random.choices(string.digits, k=6))
     
-    # Store OTP in cache (expires in 5 minutes)
+    # Store OTP in cache
     cache_key = f"password_reset_otp_{email}"
     cache.set(cache_key, {
         'otp': otp,
         'is_verified': False,
         'created_at': timezone.now().isoformat(),
         'expires_at': (timezone.now() + timedelta(minutes=5)).isoformat()
-    }, timeout=300)  # 5 minutes
+    }, timeout=300)
+    
+    cache.set(rate_limit_key, rate_limit_count + 1, timeout=900)
+    
+    # ✅ Send email with OTP (Only for valid users)
+    try:
+        send_reset_password_email(email, otp, user.first_name)
+        logger.info(f"✅ OTP sent to: {email}")
+    except Exception as e:
+        logger.error(f"❌ Email send failed: {str(e)}")
     
     # Print OTP to console (for testing)
     print(f"\n{'='*50}")
     print(f"🔐 PASSWORD RESET OTP")
     print(f"📧 Email: {email}")
+    print(f"👤 User: {user.first_name} {user.last_name}")
     print(f"🔢 OTP: {otp}")
     print(f"⏰ Valid for: 5 minutes")
     print(f"{'='*50}\n")
     
-    # Return success (include OTP only in development)
+    # ✅ Return success (Only for valid users)
     return Response({
         'success': True,
-        'message': 'OTP sent successfully',
+        'message': f'Password reset OTP sent to {email}',
         'data': {
-            'otp': otp  # Remove this line in production
+            'otp': otp,
+            'email': email
         }
     })
 

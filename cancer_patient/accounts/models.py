@@ -203,13 +203,13 @@ class NurseProfile(models.Model):
     department = models.CharField(max_length=100)
     qualification = models.TextField(blank=True)
     joining_date = models.DateField()
-    shift = models.CharField(max_length=50, blank=True)  # Morning/Night
-    employment_type = models.CharField(max_length=50, blank=True)  # Full-time/Part-time
+    shift = models.CharField(max_length=50, blank=True)
+    employment_type = models.CharField(max_length=50, blank=True)
     years_of_experience = models.IntegerField(default=0)
     is_active = models.BooleanField(default=True)
     
     # Skills & Ward Assignment
-    skills = models.JSONField(default=list, blank=True)  # e.g., ["ICU", "Pediatrics"]
+    skills = models.JSONField(default=list, blank=True)
     assigned_ward = models.CharField(max_length=100, blank=True)
     supervisor = models.CharField(max_length=100, blank=True)
     
@@ -225,22 +225,13 @@ class NurseProfile(models.Model):
     ), blank=True, null=True)
     
     # Documents
-    documents = models.JSONField(default=dict, blank=True, help_text="""Store all documents in one JSON field:
-    {
-        "qualification_certificate": "file_path_or_url",
-        "nursing_license": "file_path_or_url",
-        "id_proof": "file_path_or_url",
-        "address_proof": "file_path_or_url",
-        "experience_letter": "file_path_or_url",
-        "training_certificates": ["file1.pdf", "file2.pdf"],
-        "other_documents": ["file1.jpg", "file2.pdf"]
-    }
-    """)
+    documents = models.JSONField(default=dict, blank=True)
     profile_picture = models.CharField(max_length=500000, blank=True, null=True)
-    uploaded_documents = models.TextField(blank=True, null=True)    
-    # Licensure Information 
-    state_of_licensure  = models.CharField(max_length=100, blank=True, null=True)
-    license_number      = models.CharField(max_length=100, blank=True, null=True)
+    uploaded_documents = models.TextField(blank=True, null=True)
+    
+    # Licensure Information
+    state_of_licensure = models.CharField(max_length=100, blank=True, null=True)
+    license_number = models.CharField(max_length=100, blank=True, null=True)
     license_expiry_date = models.DateField(null=True, blank=True)
 
     # Timestamps
@@ -256,10 +247,39 @@ class NurseProfile(models.Model):
         return f"Nurse {self.nurse_id}: {self.first_name} {self.last_name}"
     
     def save(self, *args, **kwargs):
-        # Auto-generate employee_id if not provided
+        """Override save to handle Decimal128 and auto-generate employee_id"""
+        from decimal import Decimal
+        from bson import Decimal128
+        
+        # ✅ Auto-generate employee_id if not provided
         if not self.employee_id:
             import uuid
             self.employee_id = f"NUR{str(uuid.uuid4())[:8].upper()}"
+        
+        # ✅ Convert salary from Decimal128 to Decimal
+        if hasattr(self, 'salary') and self.salary is not None:
+            if isinstance(self.salary, Decimal128):
+                self.salary = self.salary.to_decimal()
+            elif hasattr(self.salary, 'to_decimal'):
+                self.salary = self.salary.to_decimal()
+            elif isinstance(self.salary, str):
+                try:
+                    self.salary = Decimal(self.salary.replace(',', '').replace('$', ''))
+                except:
+                    pass
+        
+        # ✅ Convert consultation_fee if exists
+        if hasattr(self, 'consultation_fee') and self.consultation_fee is not None:
+            if isinstance(self.consultation_fee, Decimal128):
+                self.consultation_fee = self.consultation_fee.to_decimal()
+            elif hasattr(self.consultation_fee, 'to_decimal'):
+                self.consultation_fee = self.consultation_fee.to_decimal()
+            elif isinstance(self.consultation_fee, str):
+                try:
+                    self.consultation_fee = Decimal(self.consultation_fee.replace(',', '').replace('$', ''))
+                except:
+                    pass
+        
         super().save(*args, **kwargs)
 
 class DoctorProfile(models.Model):

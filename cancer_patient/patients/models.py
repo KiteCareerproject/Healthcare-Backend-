@@ -27,7 +27,7 @@ class PatientMedicalRecord(models.Model):
     ]
     
     medical_record_id = models.AutoField(primary_key=True)
-    patient = models.ForeignKey(PatientProfile, on_delete=models.CASCADE, related_name='medical_record')
+    patient = models.ForeignKey(PatientProfile, on_delete=models.CASCADE, related_name='medical_records')
     cancer_type = models.ForeignKey(CancerType, on_delete=models.PROTECT)
     cancer_stage = models.CharField(max_length=10, choices=CANCER_STAGES)
     diagnosis_date = models.DateField()
@@ -43,6 +43,7 @@ class PatientMedicalRecord(models.Model):
     
     class Meta:
         db_table = 'patient_medical_records'
+        ordering = ['-created_at'] 
     
     def __str__(self):
         return f"MedicalRecord {self.medical_record_id}: Patient {self.patient.patient_id}"

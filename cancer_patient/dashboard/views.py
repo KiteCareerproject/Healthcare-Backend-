@@ -38,8 +38,16 @@ from monitoring.serializers import AlertSerializer
 from rest_framework.views import APIView
 from datetime import datetime, timedelta
 
+from rest_framework.pagination import PageNumberPagination
+from django.db.models import Q
+
 logger = logging.getLogger(__name__)
 User = get_user_model()
+
+class PatientPagination(PageNumberPagination):
+    page_size = 20  # Default page size
+    page_size_query_param = 'page_size'  # Allow client to set page size
+    max_page_size = 100
 
 # ==================== ADMIN VERIFICATION ====================
 def verify_admin(user):
@@ -449,25 +457,27 @@ def update_nurse(request, nurse_id):
     except NurseProfile.DoesNotExist:
         raise APIError("Nurse not found", status_code=status.HTTP_404_NOT_FOUND)
     
-    # ✅ ADD DEBUG - Print before update
-    # print("=" * 60)
-    # print(f"🟡 UPDATE NURSE - ID: {nurse_id}")
-    # print(f"🟡 Before Update - Experience: {nurse.years_of_experience}")
-    # print(f"🟡 Before Update - Blood Group: {nurse.blood_group}")
-    # print(f"🟡 Before Update - Gender: {nurse.gender}")
-    # print(f"🟡 Received Data: {request.data}")
-    
-    # Convert salary in request data
     data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
-    if 'salary' in data:
+    
+    # ✅ Convert is_active
+    if 'is_active' in data:
+        is_active_value = data['is_active']
+        if isinstance(is_active_value, str):
+            data['is_active'] = is_active_value.lower() == 'true'
+        elif isinstance(is_active_value, (int, float)):
+            data['is_active'] = bool(is_active_value)
+    
+    # ✅ Convert salary
+    if 'salary' in data and data['salary'] is not None:
         salary_value = data['salary']
-        if isinstance(salary_value, str):
-            try:
+        try:
+            if isinstance(salary_value, str):
                 data['salary'] = Decimal(salary_value.replace(',', ''))
-            except:
-                pass
-        elif isinstance(salary_value, Decimal128):
-            data['salary'] = salary_value.to_decimal()
+            elif hasattr(salary_value, 'to_decimal'):
+                data['salary'] = salary_value.to_decimal()
+        except Exception as e:
+            print(f"Salary conversion error: {e}")
+            data['salary'] = None
     
     partial = request.method == 'PATCH'
     
@@ -477,145 +487,168 @@ def update_nurse(request, nurse_id):
         existing_user = User.objects.filter(
             phone_number=phone
         ).exclude(user_id=nurse.user.user_id).first()
-        
         if existing_user:
             raise APIError(
                 f"Phone number '{phone}' is already registered to another user",
                 status_code=status.HTTP_400_BAD_REQUEST
             )
     
+    # Check email uniqueness
+    if 'email' in data and data['email']:
+        email = data['email']
+        existing_user = User.objects.filter(
+            email=email
+        ).exclude(user_id=nurse.user.user_id).first()
+        if existing_user:
+            raise APIError(
+                f"Email '{email}' is already registered to another user",
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+    
+    # ✅ Handle is_active - Update both
+    if 'is_active' in data:
+        is_active_value = data['is_active']
+        user = nurse.user
+        user.is_active = is_active_value
+        user.save()
+        nurse.is_active = is_active_value
+        nurse.save()
+        data.pop('is_active')
+    
     serializer = NurseUpdateSerializer(nurse, data=data, partial=partial)
     
     if serializer.is_valid():
         updated_nurse = serializer.save()
         
-        # ✅ ADD DEBUG - Print after update
-        print("🟢 After Update - Calling refresh_from_db()")
-        updated_nurse.refresh_from_db()  # ✅ Force refresh from database
-        # print(f"🟢 After Update - Experience: {updated_nurse.years_of_experience}")
-        # print(f"🟢 After Update - Blood Group: {updated_nurse.blood_group}")
-        # print(f"🟢 After Update - Gender: {updated_nurse.gender}")
-        # print("=" * 60)
+        # ✅ CRITICAL: Convert Decimal128 to Decimal before saving
+        from bson import Decimal128
+        from decimal import Decimal
         
-        # ✅ Get fresh data from serializer
-        serialized_data = NurseSerializer(updated_nurse).data
-        # print(f"🟢 Serialized Response: {serialized_data}")
+        # Convert salary
+        if hasattr(updated_nurse, 'salary') and updated_nurse.salary is not None:
+            if isinstance(updated_nurse.salary, Decimal128):
+                updated_nurse.salary = updated_nurse.salary.to_decimal()
+            elif hasattr(updated_nurse.salary, 'to_decimal'):
+                updated_nurse.salary = updated_nurse.salary.to_decimal()
+            elif isinstance(updated_nurse.salary, str):
+                try:
+                    updated_nurse.salary = Decimal(updated_nurse.salary.replace(',', ''))
+                except:
+                    pass
+        
+        # ✅ Save with converted values
+        updated_nurse.save()
+        
+        # Force refresh
+        updated_nurse.refresh_from_db()
+        updated_nurse.user.refresh_from_db()
         
         return Response({
             'success': True,
             'message': 'Nurse updated successfully',
-            'data': serialized_data
+            'data': NurseSerializer(updated_nurse).data
         })
     
-    print(f"🔴 Validation Error: {serializer.errors}")
     raise APIError("Validation error", errors=serializer.errors)
+    
 
 
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
 @handle_errors
 def delete_nurse(request, nurse_id):
-    """Delete nurse (Admin only) - Permanent deletion from MongoDB"""
+    """PERMANENTLY delete nurse - Simple version"""
     verify_admin(request.user)
     
+    from pymongo import MongoClient
+    import traceback
+    from datetime import datetime
+    
     try:
-        from pymongo import MongoClient
-        from bson import ObjectId
+        # ✅ Django ORM-ஐ பயன்படுத்தி Nurse-ஐ கண்டுபிடிக்கவும்
+        nurse = NurseProfile.objects.select_related('user').get(nurse_id=nurse_id)
+    except NurseProfile.DoesNotExist:
+        raise APIError(
+            f"Nurse with ID {nurse_id} not found", 
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    
+    user = nurse.user
+    user_email = user.email
+    user_id = user.user_id
+    nurse_name = f"{user.first_name} {user.last_name}".strip()
+    
+    logger.warning(f"⚠️ PERMANENTLY DELETING nurse {nurse_id} ({user_email}) by {request.user.email}")
+    
+    try:
+        # ✅ Delete related data first using Django ORM
+        try:
+            from patients.models import PatientMedicalRecord
+            PatientMedicalRecord.objects.filter(assigned_nurse=nurse).delete()
+        except:
+            pass
         
+        try:
+            from questionnaire.models import QuestionResponse, DailyResponse, QuestionnaireAssignment
+            # Get patient IDs
+            from patients.models import PatientMedicalRecord
+            patient_ids = list(
+                PatientMedicalRecord.objects.filter(
+                    assigned_nurse=nurse
+                ).values_list('patient_id', flat=True)
+            )
+            if patient_ids:
+                QuestionResponse.objects.filter(patient_id__in=patient_ids).delete()
+                DailyResponse.objects.filter(patient_id__in=patient_ids).delete()
+                QuestionnaireAssignment.objects.filter(patient_id__in=patient_ids).delete()
+        except:
+            pass
+        
+        try:
+            from alerts.models import Alert
+            Alert.objects.filter(assigned_to_nurse=nurse).delete()
+        except:
+            pass
+        
+        try:
+            from appointments.models import Appointment
+            Appointment.objects.filter(nurse_id=nurse_id).delete()
+        except:
+            pass
+        
+        # ✅ Delete nurse and user
+        nurse.delete()
+        user.delete()
+        
+        # ✅ Delete from MongoDB (for backup/consistency)
         client = MongoClient('localhost', 27017)
         db = client['cancer_db']
         
-        # Find the nurse
-        nurse = db.nurse_profiles.find_one({'nurse_id': int(nurse_id)})
-        if not nurse:
-            raise APIError(
-                f"Nurse with ID {nurse_id} not found", 
-                status_code=status.HTTP_404_NOT_FOUND
-            )
+        db.nurse_profiles.delete_one({'nurse_id': int(nurse_id)})
+        db.users.delete_one({'user_id': user_id})
+        db.nurse_attendance.delete_many({'nurse_id': int(nurse_id)})
+        db.nurse_schedule.delete_many({'nurse_id': int(nurse_id)})
+        db.nurse_leave_requests.delete_many({'nurse_id': int(nurse_id)})
         
-        logger.info(f"Permanently deleting nurse {nurse_id}")
+        client.close()
         
-        # Get user_id before deletion
-        user_id = nurse.get('user')
+        logger.warning(f"✅ Nurse {nurse_id} PERMANENTLY DELETED")
         
-        # Delete nurse profile
-        nurse_result = db.nurse_profiles.delete_one({'nurse_id': int(nurse_id)})
-        
-        # Delete associated user account if exists
-        user_deleted = False
-        if user_id:
-            user_result = db.users.delete_one({'user_id': user_id})
-            if user_result.deleted_count > 0:
-                user_deleted = True
-                logger.info(f"Associated user account {user_id} also deleted")
-        
-        # Also delete from any other related collections (optional)
-        # For example, delete attendance records, salary records, etc.
-        attendance_result = db.nurse_attendance.delete_many({'nurse_id': int(nurse_id)})
-        if attendance_result.deleted_count > 0:
-            logger.info(f"Deleted {attendance_result.deleted_count} attendance records")
-        
-        # Delete from nurse_schedule collection if exists
-        schedule_result = db.nurse_schedule.delete_many({'nurse_id': int(nurse_id)})
-        if schedule_result.deleted_count > 0:
-            logger.info(f"Deleted {schedule_result.deleted_count} schedule records")
-        
-        # Delete from nurse_leave_requests if exists
-        leave_result = db.nurse_leave_requests.delete_many({'nurse_id': int(nurse_id)})
-        if leave_result.deleted_count > 0:
-            logger.info(f"Deleted {leave_result.deleted_count} leave requests")
-        
-        # Delete uploaded files if they exist (optional - if you have file storage)
-        # You might want to delete the actual files from storage here
-        if nurse.get('profile_picture'):
-            # Delete profile picture file from storage
-            try:
-                import os
-                profile_pic_path = nurse.get('profile_picture')
-                if profile_pic_path and os.path.exists(profile_pic_path):
-                    os.remove(profile_pic_path)
-                    logger.info(f"Deleted profile picture: {profile_pic_path}")
-            except Exception as e:
-                logger.warning(f"Could not delete profile picture: {str(e)}")
-        
-        if nurse.get('uploaded_documents'):
-            # Delete document file from storage
-            try:
-                import os
-                doc_path = nurse.get('uploaded_documents')
-                if doc_path and os.path.exists(doc_path):
-                    os.remove(doc_path)
-                    logger.info(f"Deleted document: {doc_path}")
-            except Exception as e:
-                logger.warning(f"Could not delete document: {str(e)}")
-        
-        if nurse_result.deleted_count > 0:
-            message = f"Nurse {nurse_id} and all associated data permanently deleted"
-            if user_deleted:
-                message += f" (including user account {user_id})"
-            
-            logger.warning(f"Nurse {nurse_id} permanently deleted by {request.user.email}")
-            
-            return Response({
-                'success': True,
-                'message': message,
-                'data': {
-                    'nurse_id': nurse_id,
-                    'profile_deleted': True,
-                    'user_deleted': user_deleted,
-                    'attendance_deleted': attendance_result.deleted_count if attendance_result else 0,
-                    'schedule_deleted': schedule_result.deleted_count if schedule_result else 0,
-                    'leave_deleted': leave_result.deleted_count if leave_result else 0
-                }
-            })
-        else:
-            raise APIError(
-                f"Failed to delete nurse {nurse_id}",
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response({
+            'success': True,
+            'message': f'Nurse {nurse_id} ({nurse_name}) PERMANENTLY DELETED',
+            'data': {
+                'nurse_id': int(nurse_id),
+                'nurse_name': nurse_name,
+                'email': user_email,
+                'deleted_at': datetime.now().isoformat(),
+                'deleted_by': request.user.email
+            }
+        }, status=status.HTTP_200_OK)
         
     except Exception as e:
-        logger.error(f"Error deleting nurse {nurse_id}: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        logger.error(traceback.format_exc())
         raise APIError(
             f"Failed to delete nurse: {str(e)}",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -712,44 +745,45 @@ def get_all_doctors(request):
     
     for doctor in all_doctors:
         try:
-            # Filter by specialization
+            # ✅ Filter by specialization
             if specialization_filter:
                 doctor_specialization = getattr(doctor, 'specialization', '') or ''
                 if specialization_filter.lower() not in doctor_specialization.lower():
                     continue
             
-            # Filter by department
+            # ✅ Filter by department
             if department_filter:
                 doctor_department = getattr(doctor, 'department', '') or ''
                 if department_filter.lower() not in doctor_department.lower():
                     continue
             
-            # Filter by shift
+            # ✅ Filter by shift
             if shift_filter:
                 doctor_shift = getattr(doctor, 'shift', '') or ''
                 if shift_filter.lower() not in doctor_shift.lower():
                     continue
             
-            # Filter by is_active
+            # ✅ FIXED: Filter by is_active - Get from User model
             if is_active_filter is not None:
                 is_active_value = is_active_filter.lower() == 'true'
-                doctor_is_active = getattr(doctor, 'is_active', True)
+                # ✅ Get is_active from User model
+                doctor_is_active = doctor.user.is_active if doctor.user else True
                 if doctor_is_active != is_active_value:
                     continue
             
-            # Filter by blood_group
+            # ✅ Filter by blood_group
             if blood_group_filter:
                 doctor_blood_group = getattr(doctor, 'blood_group', '') or ''
                 if blood_group_filter.upper() not in doctor_blood_group.upper():
                     continue
             
-            # Filter by gender
+            # ✅ Filter by gender
             if gender_filter:
                 doctor_gender = getattr(doctor, 'gender', '') or ''
                 if gender_filter.upper() != doctor_gender.upper():
                     continue
             
-            # Filter by employment_type
+            # ✅ Filter by employment_type
             if employment_type_filter:
                 doctor_employment_type = getattr(doctor, 'employment_type', '') or ''
                 if employment_type_filter.lower() not in doctor_employment_type.lower():
@@ -824,7 +858,7 @@ def get_all_doctors(request):
     doctor_data_list = []
     for doctor in paginated_doctors:
         try:
-            # ✅ FIXED: Always get name from User model
+            # ✅ Get name from User model
             name = f"{doctor.user.first_name} {doctor.user.last_name}".strip() or doctor.user.username
             
             # Get specialization safely
@@ -855,7 +889,7 @@ def get_all_doctors(request):
                 'phone': doctor.user.phone_number if doctor.user else "",
                 'phone_number': doctor.user.phone_number if doctor.user else "",
                 'username': doctor.user.username if doctor.user else "",
-                'is_active': getattr(doctor, 'is_active', True),
+                'is_active': doctor.user.is_active if doctor.user else True,  # ✅ From User model
                 
                 # ✅ Personal Details
                 'address': getattr(doctor, 'address', None),
@@ -864,7 +898,7 @@ def get_all_doctors(request):
                 'gender': getattr(doctor, 'gender', None),
                 'blood_group': getattr(doctor, 'blood_group', None),
                 
-                # ✅ Emergency Contact (if exists in DoctorProfile)
+                # ✅ Emergency Contact
                 'emergency_contact_name': getattr(doctor, 'emergency_contact_name', None),
                 'emergency_contact_phone': getattr(doctor, 'emergency_contact_phone', None),
                 'emergency_contact_relation': getattr(doctor, 'emergency_contact_relation', None),
@@ -994,6 +1028,19 @@ def update_doctor(request, doctor_id):
                 status_code=status.HTTP_400_BAD_REQUEST
             )
     
+    # ✅ Check email uniqueness before update
+    if 'email' in data and data['email']:
+        email = data['email']
+        existing_user = User.objects.filter(
+            email=email
+        ).exclude(user_id=doctor.user.user_id).first()
+        
+        if existing_user:
+            raise APIError(
+                f"Email '{email}' is already registered to another user",
+                status_code=status.HTTP_400_BAD_REQUEST
+            )
+    
     serializer = DoctorUpdateSerializer(doctor, data=data, partial=partial)
     
     if serializer.is_valid():
@@ -1019,55 +1066,99 @@ def update_doctor(request, doctor_id):
 @permission_classes([IsAuthenticated])
 @handle_errors
 def delete_doctor(request, doctor_id):
-    """Delete doctor permanently (Admin only)"""
+    """PERMANENTLY delete doctor - Simple version"""
     verify_admin(request.user)
     
+    from pymongo import MongoClient
+    import traceback
+    from datetime import datetime
+    
     try:
-        from pymongo import MongoClient
+        doctor = DoctorProfile.objects.select_related('user').get(doctor_id=doctor_id)
+    except DoctorProfile.DoesNotExist:
+        raise APIError(
+            f"Doctor with ID {doctor_id} not found", 
+            status_code=status.HTTP_404_NOT_FOUND
+        )
+    
+    user = doctor.user
+    user_email = user.email
+    user_id = user.user_id
+    doctor_name = f"{user.first_name} {user.last_name}".strip()
+    
+    logger.warning(f"⚠️ PERMANENTLY DELETING doctor {doctor_id} ({user_email}) by {request.user.email}")
+    
+    try:
+        # ✅ Delete using Django ORM (Djongo compatible)
+        # Delete related data first
+        try:
+            from patients.models import PatientMedicalRecord, PatientDietaryPlan, MealPlan
+            PatientMedicalRecord.objects.filter(treating_doctor=doctor).delete()
+            PatientDietaryPlan.objects.filter(doctor=doctor).delete()
+            MealPlan.objects.filter(doctor=doctor).delete()
+        except:
+            pass
         
+        try:
+            from questionnaire.models import QuestionResponse, DailyResponse, QuestionnaireAssignment
+            # Get patient IDs
+            from patients.models import PatientMedicalRecord
+            patient_ids = list(
+                PatientMedicalRecord.objects.filter(
+                    treating_doctor=doctor
+                ).values_list('patient_id', flat=True)
+            )
+            if patient_ids:
+                QuestionResponse.objects.filter(patient_id__in=patient_ids).delete()
+                DailyResponse.objects.filter(patient_id__in=patient_ids).delete()
+                QuestionnaireAssignment.objects.filter(patient_id__in=patient_ids).delete()
+        except:
+            pass
+        
+        try:
+            from appointments.models import Appointment
+            Appointment.objects.filter(doctor_id=doctor_id).delete()
+        except:
+            pass
+        
+        try:
+            from prescriptions.models import Prescription
+            Prescription.objects.filter(doctor_id=doctor_id).delete()
+        except:
+            pass
+        
+        # ✅ Delete doctor and user
+        doctor.delete()
+        user.delete()
+        
+        # ✅ Delete from MongoDB
         client = MongoClient('localhost', 27017)
         db = client['cancer_db']
         
-        # Find the doctor
-        doctor = db.doctor_profiles.find_one({'doctor_id': int(doctor_id)})
-        if not doctor:
-            raise APIError(
-                f"Doctor with ID {doctor_id} not found", 
-                status_code=status.HTTP_404_NOT_FOUND
-            )
-        
-        logger.warning(f"Permanently deleting doctor {doctor_id} by {request.user.email}")
-        
-        # Hard delete - remove from both collections
-        user_id = doctor.get('user')
-        
-        # Delete doctor profile
-        doctor_result = db.doctor_profiles.delete_one({'doctor_id': int(doctor_id)})
-        
-        # Delete associated user account
-        user_result = None
-        if user_id:
-            user_result = db.users.delete_one({'user_id': user_id})
-        
-        # Optional: Delete associated data (appointments, prescriptions, etc.)
+        db.doctor_profiles.delete_one({'doctor_id': int(doctor_id)})
+        db.users.delete_one({'user_id': user_id})
         db.appointments.delete_many({'doctor_id': int(doctor_id)})
         db.prescriptions.delete_many({'doctor_id': int(doctor_id)})
         
-        message = f"Doctor {doctor_id} permanently deleted"
-        if user_result and user_result.deleted_count > 0:
-            message += f" along with user account {user_id}"
+        client.close()
         
-        logger.warning(f"Doctor {doctor_id} permanently deleted by {request.user.email}")
+        logger.warning(f"✅ Doctor {doctor_id} PERMANENTLY DELETED")
         
         return Response({
             'success': True,
-            'message': message,
-            'deleted_doctor': doctor_result.deleted_count > 0,
-            'deleted_user': user_result.deleted_count > 0 if user_result else False
-        })
+            'message': f'Doctor {doctor_id} ({doctor_name}) PERMANENTLY DELETED',
+            'data': {
+                'doctor_id': int(doctor_id),
+                'doctor_name': doctor_name,
+                'email': user_email,
+                'deleted_at': datetime.now().isoformat(),
+                'deleted_by': request.user.email
+            }
+        }, status=status.HTTP_200_OK)
         
     except Exception as e:
-        logger.error(f"Error deleting doctor {doctor_id}: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        logger.error(traceback.format_exc())
         raise APIError(
             f"Failed to delete doctor: {str(e)}",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -1100,15 +1191,70 @@ def create_patient(request):
 @permission_classes([IsAuthenticated])
 @handle_errors
 def get_all_patients(request):
-    """Get all patient profiles (Admin only)"""
+    """Get all patient profiles with pagination (Admin only)"""
     verify_admin(request.user)
     
-    patients = PatientProfile.objects.select_related('user').order_by('-user__date_joined').all()
-    serializer = PatientSerializer(patients, many=True)
+    # ✅ Get pagination parameters
+    page = int(request.query_params.get('page', 1))
+    page_size = int(request.query_params.get('page_size', 10))
     
+    # ✅ Validate page_size
+    if page_size > 100:
+        page_size = 100
+    
+    # ✅ Get filter parameters
+    search = request.query_params.get('search', '').strip()
+    status_filter = request.query_params.get('status', '')
+    gender_filter = request.query_params.get('gender', '')
+    
+    # ✅ Start with all patients
+    patients = PatientProfile.objects.select_related('user').order_by('-user__date_joined')
+    
+    # ✅ Apply search filter
+    if search:
+        patients = patients.filter(
+            Q(user__first_name__icontains=search) |
+            Q(user__last_name__icontains=search) |
+            Q(user__email__icontains=search) |
+            Q(user__phone_number__icontains=search) |
+            Q(patient_id__icontains=search)
+        )
+    
+    # ✅ Apply status filter
+    if status_filter:
+        if status_filter.lower() == 'active':
+            patients = patients.filter(user__is_active=True)
+        elif status_filter.lower() == 'inactive':
+            patients = patients.filter(user__is_active=False)
+    
+    # ✅ Apply gender filter
+    if gender_filter:
+        patients = patients.filter(gender=gender_filter.upper())
+    
+    # ✅ Get total count
+    total_count = patients.count()
+    
+    # ✅ Calculate pagination
+    start = (page - 1) * page_size
+    end = start + page_size
+    total_pages = (total_count + page_size - 1) // page_size if total_count > 0 else 1
+    
+    # ✅ Get paginated patients
+    paginated_patients = patients[start:end]
+    
+    # ✅ Serialize
+    serializer = PatientSerializer(paginated_patients, many=True)
+    
+    # ✅ Return response with your exact pagination format
     return Response({
         'success': True,
-        'data': serializer.data
+        'data': serializer.data,
+        'pagination': {
+            'total': total_count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages
+        }
     })
 
 @api_view(['GET'])
@@ -2260,6 +2406,860 @@ def get_doctor_patients(request, doctor_id):
 #         'data': {}
 #     })
 
+# @api_view(['GET'])
+# @permission_classes([IsAuthenticated])
+# @handle_errors
+# def get_dashboard_stats(request):
+#     """Get dashboard statistics based on user type"""
+#     user = request.user
+#     today = timezone.now().date()
+#     start_of_month = today.replace(day=1)
+    
+#     # Convert dates to datetime for MongoDB queries
+#     start_datetime = datetime.combine(start_of_month, datetime.min.time())
+#     today_datetime = datetime.combine(today, datetime.max.time())
+    
+#     if user.user_type == 'NURSE':
+#         try:
+#             nurse = NurseProfile.objects.get(user=user)
+            
+#             # Patients assigned to this nurse (from PatientMedicalRecord)
+#             total_patients = PatientMedicalRecord.objects.filter(
+#                 assigned_nurse=nurse
+#             ).count()
+            
+#             # New alerts for this nurse
+#             new_alerts = Alert.objects.filter(
+#                 assigned_to_nurse=nurse,
+#                 status='NEW'
+#             ).count()
+            
+#             # Today responses
+#             today_responses = DailyResponse.objects.filter(
+#                 response_date__gte=start_of_month,
+#                 response_date__lte=today
+#             ).count()
+            
+#             # Pending questionnaires
+#             pending_questionnaires = QuestionnaireAssignment.objects.filter(
+#                 status='PENDING'
+#             ).count()
+            
+#             # Active patients for this nurse (submitted response in last 7 days)
+#             last_7_days_ago = today - timedelta(days=7)
+#             last_7_days_start = datetime.combine(last_7_days_ago, datetime.min.time())
+            
+#             recent_responses = DailyResponse.objects.filter(
+#                 response_date__gte=last_7_days_start,
+#                 response_date__lte=today_datetime
+#             )
+            
+#             active_patient_ids = set()
+#             for response in recent_responses:
+#                 try:
+#                     if response.patient and response.patient.assigned_nurse == nurse:
+#                         if response.patient.patient:
+#                             active_patient_ids.add(response.patient.patient.patient_id)
+#                 except Exception as e:
+#                     continue
+            
+#             active_patients = len(active_patient_ids)
+#             inactive_patients = total_patients - active_patients
+            
+#             # Get detailed patient list for this nurse
+#             nurse_patients = PatientMedicalRecord.objects.filter(assigned_nurse=nurse)
+#             patient_details_list = []
+            
+#             for patient_record in nurse_patients:
+#                 try:
+#                     patient = patient_record.patient
+#                     if patient:
+#                         # Check if patient is active
+#                         is_active = False
+#                         last_response_date = None
+                        
+#                         patient_responses = DailyResponse.objects.filter(
+#                             patient=patient_record,
+#                             response_date__gte=last_7_days_start,
+#                             response_date__lte=today_datetime
+#                         )
+#                         is_active = patient_responses.exists()
+                        
+#                         last_response = DailyResponse.objects.filter(
+#                             patient=patient_record
+#                         ).order_by('-response_date').first()
+#                         if last_response:
+#                             last_response_date = last_response.response_date
+                        
+#                         patient_details_list.append({
+#                             'patient_id': patient.patient_id,
+#                             'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
+#                             'email': patient.user.email,
+#                             'phone': patient.user.phone_number,
+#                             'status': 'ACTIVE' if is_active else 'INACTIVE',
+#                             'last_response_date': last_response_date,
+#                             'gender': patient.gender,
+#                             'health_status': patient_record.health_status if hasattr(patient_record, 'health_status') else None,
+#                             'cancer_stage': patient_record.cancer_stage if hasattr(patient_record, 'cancer_stage') else None
+#                         })
+#                 except Exception as e:
+#                     continue
+            
+#             active_patient_details = [p for p in patient_details_list if p['status'] == 'ACTIVE']
+#             inactive_patient_details = [p for p in patient_details_list if p['status'] == 'INACTIVE']
+            
+#             # Recovery rate for nurse's patients
+#             total_patients_with_status = 0
+#             improving_patients = 0
+            
+#             for patient in nurse_patients:
+#                 try:
+#                     if hasattr(patient, 'health_status') and patient.health_status:
+#                         total_patients_with_status += 1
+#                         if patient.health_status == 'IMPROVING':
+#                             improving_patients += 1
+#                 except Exception as e:
+#                     continue
+            
+#             recovery_rate = round(
+#                 (improving_patients / total_patients_with_status * 100) 
+#                 if total_patients_with_status > 0 else 0, 
+#                 1
+#             )
+            
+#             return Response({
+#                 'success': True,
+#                 'data': {
+#                     'total_patients': total_patients,
+#                     'new_alerts': new_alerts,
+#                     'today_responses': today_responses,
+#                     'pending_questionnaires': pending_questionnaires,
+#                     'patient_stats': {
+#                         'active_patients': active_patients,
+#                         'inactive_patients': inactive_patients,
+#                         'total_patients': total_patients,
+#                         'active_percentage': round((active_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+#                         'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1)
+#                     },
+#                     'patient_details': {
+#                         'active': {
+#                             'count': len(active_patient_details),
+#                             'patients': active_patient_details
+#                         },
+#                         'inactive': {
+#                             'count': len(inactive_patient_details),
+#                             'patients': inactive_patient_details
+#                         }
+#                     },
+#                     'recovery_stats': {
+#                         'recovery_rate': recovery_rate,
+#                         'improving_patients': improving_patients,
+#                         'total_patients_tracked': total_patients_with_status,
+#                         'remaining_patients': total_patients_with_status - improving_patients
+#                     },
+#                     'recent_alerts': AlertSerializer(
+#                         Alert.objects.filter(assigned_to_nurse=nurse)[:5], 
+#                         many=True
+#                     ).data
+#                 }
+#             })
+            
+#         except NurseProfile.DoesNotExist:
+#             raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+#     elif user.user_type == 'ADMIN':
+#         # Admin Dashboard
+#         # ========== Total Counts from Profile Models ==========
+#         total_patients = PatientProfile.objects.count()
+#         total_doctors = DoctorProfile.objects.count()
+#         total_nurses = NurseProfile.objects.count()
+        
+#         # ========== Patient Status based on patient_status field ==========
+#         active_patients = PatientProfile.objects.filter(patient_status='active').count()
+#         inactive_patients = PatientProfile.objects.filter(patient_status='inactive').count()
+#         recovered_patients = PatientProfile.objects.filter(patient_status='recovered').count()
+        
+#         # ========== Active Questions ==========
+#         last_7_days_ago = today - timedelta(days=7)
+#         last_7_days_start = datetime.combine(last_7_days_ago, datetime.min.time())
+        
+#         recent_responses = DailyResponse.objects.filter(
+#             response_date__gte=last_7_days_start,
+#             response_date__lte=today_datetime
+#         )
+        
+#         active_question_ids = set()
+#         for response in recent_responses:
+#             try:
+#                 question_responses = QuestionResponse.objects.filter(daily_response=response)
+#                 for qr in question_responses:
+#                     if qr.assigned_question:
+#                         active_question_ids.add(qr.assigned_question.pk)
+#             except Exception as e:
+#                 continue
+        
+#         active_questions = len(active_question_ids)
+        
+#         # ========== Active Questionnaires ==========
+#         active_questionnaires = QuestionnaireAssignment.objects.filter(
+#             status='IN_PROGRESS'
+#         ).count()
+        
+#         # ========== Reports Generated ==========
+#         reports_generated = QuestionnaireAssignment.objects.filter(
+#             status='COMPLETED'
+#         ).count()
+        
+#         # ========== Staff Statistics (Manual count for Djongo compatibility) ==========
+#         # Active Doctors - Manual count
+#         active_doctors = 0
+#         for doctor in DoctorProfile.objects.all():
+#             try:
+#                 is_active = getattr(doctor, 'is_active', True)
+#                 if is_active:
+#                     active_doctors += 1
+#             except Exception as e:
+#                 active_doctors += 1
+#         inactive_doctors = total_doctors - active_doctors
+        
+#         # Active Nurses - Manual count
+#         active_nurses = 0
+#         for nurse in NurseProfile.objects.all():
+#             try:
+#                 is_active = getattr(nurse, 'is_active', True)
+#                 if is_active:
+#                     active_nurses += 1
+#             except Exception as e:
+#                 active_nurses += 1
+#         inactive_nurses = total_nurses - active_nurses
+        
+#         # ========== Doctor Details with Active/Inactive Status ==========
+#         doctor_details_list = []
+#         for doctor in DoctorProfile.objects.all():
+#             try:
+#                 # Check if doctor is active based on is_active field
+#                 is_doctor_active = getattr(doctor, 'is_active', True)
+                
+#                 # Get patient count for this doctor
+#                 patient_count = PatientMedicalRecord.objects.filter(treating_doctor=doctor).count()
+                
+#                 # Get assigned patients list (remove duplicates)
+#                 assigned_patients = []
+#                 seen_patients = set()
+#                 patient_records = PatientMedicalRecord.objects.filter(treating_doctor=doctor)
+#                 for pr in patient_records:
+#                     if pr.patient and pr.patient.patient_id not in seen_patients:
+#                         seen_patients.add(pr.patient.patient_id)
+#                         assigned_patients.append({
+#                             'patient_id': pr.patient.patient_id,
+#                             'name': f"{pr.patient.first_name} {pr.patient.last_name}".strip() or pr.patient.user.username
+#                         })
+                
+#                 # Get name from doctor fields
+#                 doctor_name = ""
+#                 if hasattr(doctor, 'first_name') and doctor.first_name:
+#                     doctor_name = f"{doctor.first_name} {doctor.last_name}".strip()
+#                 else:
+#                     doctor_name = f"{doctor.user.first_name} {doctor.user.last_name}".strip() or doctor.user.username
+                
+#                 doctor_details_list.append({
+#                     'doctor_id': doctor.pk,
+#                     'name': doctor_name,
+#                     'email': getattr(doctor, 'email', None) or doctor.user.email,
+#                     'phone': getattr(doctor, 'phone_number', None) or doctor.user.phone_number,
+#                     'specialization': getattr(doctor, 'specialization', None),
+#                     'status': 'ACTIVE' if is_doctor_active else 'INACTIVE',
+#                     'patient_count': patient_count,
+#                     'assigned_patients': assigned_patients[:10]
+#                 })
+#             except Exception as e:
+#                 print(f"Error processing doctor {doctor.pk}: {e}")
+#                 continue
+        
+#         active_doctor_details = [d for d in doctor_details_list if d['status'] == 'ACTIVE']
+#         inactive_doctor_details = [d for d in doctor_details_list if d['status'] == 'INACTIVE']
+        
+#         # ========== Nurse Details with Active/Inactive Status ==========
+#         nurse_details_list = []
+#         for nurse in NurseProfile.objects.all():
+#             try:
+#                 # Check if nurse is active based on is_active field
+#                 is_nurse_active = getattr(nurse, 'is_active', True)
+                
+#                 # Get patient count for this nurse
+#                 patient_count = PatientMedicalRecord.objects.filter(assigned_nurse=nurse).count()
+                
+#                 # Get assigned patients list (remove duplicates)
+#                 assigned_patients = []
+#                 seen_patients = set()
+#                 patient_records = PatientMedicalRecord.objects.filter(assigned_nurse=nurse)
+#                 for pr in patient_records:
+#                     if pr.patient and pr.patient.patient_id not in seen_patients:
+#                         seen_patients.add(pr.patient.patient_id)
+#                         assigned_patients.append({
+#                             'patient_id': pr.patient.patient_id,
+#                             'name': f"{pr.patient.first_name} {pr.patient.last_name}".strip() or pr.patient.user.username
+#                         })
+                
+#                 # Get name from nurse fields
+#                 nurse_name = ""
+#                 if hasattr(nurse, 'first_name') and nurse.first_name:
+#                     nurse_name = f"{nurse.first_name} {nurse.last_name}".strip()
+#                 else:
+#                     nurse_name = f"{nurse.user.first_name} {nurse.user.last_name}".strip() or nurse.user.username
+                
+#                 nurse_details_list.append({
+#                     'nurse_id': nurse.pk,
+#                     'name': nurse_name,
+#                     'email': getattr(nurse, 'email', None) or nurse.user.email,
+#                     'phone': getattr(nurse, 'phone_number', None) or nurse.user.phone_number,
+#                     'status': 'ACTIVE' if is_nurse_active else 'INACTIVE',
+#                     'patient_count': patient_count,
+#                     'assigned_patients': assigned_patients[:10]
+#                 })
+#             except Exception as e:
+#                 print(f"Error processing nurse {nurse.pk}: {e}")
+#                 continue
+        
+#         active_nurse_details = [n for n in nurse_details_list if n['status'] == 'ACTIVE']
+#         inactive_nurse_details = [n for n in nurse_details_list if n['status'] == 'INACTIVE']
+        
+#         # ========== Patient Details with Status from patient_status field ==========
+#         from datetime import date as date_module
+        
+#         def calculate_age(birth_date):
+#             if birth_date:
+#                 today_date = date_module.today()
+#                 return today_date.year - birth_date.year - (
+#                     (today_date.month, today_date.day) < (birth_date.month, birth_date.day)
+#                 )
+#             return None
+        
+#         patient_details_list = []
+#         for patient in PatientProfile.objects.all():
+#             try:
+#                 # Get patient medical record
+#                 medical_record = PatientMedicalRecord.objects.filter(patient=patient).first()
+                
+#                 # ✅ Use patient_status from PatientProfile
+#                 is_patient_active = patient.patient_status == 'active'
+                
+#                 # Check for recent responses (optional - keep for last_response_date)
+#                 last_response_date = None
+                
+#                 if medical_record:
+#                     last_response = DailyResponse.objects.filter(
+#                         patient=medical_record
+#                     ).order_by('-response_date').first()
+#                     if last_response:
+#                         last_response_date = last_response.response_date
+                
+#                 # Get nurse and doctor names
+#                 nurse_name = None
+#                 doctor_name = None
+#                 if medical_record:
+#                     if medical_record.assigned_nurse:
+#                         nurse = medical_record.assigned_nurse
+#                         if hasattr(nurse, 'first_name') and nurse.first_name:
+#                             nurse_name = f"{nurse.first_name} {nurse.last_name}".strip()
+#                         else:
+#                             nurse_name = f"{nurse.user.first_name} {nurse.user.last_name}".strip() or nurse.user.username
+#                     if medical_record.treating_doctor:
+#                         doctor = medical_record.treating_doctor
+#                         if hasattr(doctor, 'first_name') and doctor.first_name:
+#                             doctor_name = f"{doctor.first_name} {doctor.last_name}".strip()
+#                         else:
+#                             doctor_name = f"{doctor.user.first_name} {doctor.user.last_name}".strip() or doctor.user.username
+                
+#                 # Calculate age
+#                 patient_age = None
+#                 if patient.date_of_birth:
+#                     patient_age = calculate_age(patient.date_of_birth)
+                
+#                 # Get health status and cancer stage safely
+#                 health_status = None
+#                 cancer_stage = None
+#                 if medical_record:
+#                     if hasattr(medical_record, 'health_status'):
+#                         health_status = medical_record.health_status
+#                     if hasattr(medical_record, 'cancer_stage'):
+#                         cancer_stage = medical_record.cancer_stage
+                
+#                 # ✅ Patient status display mapping
+#                 status_display = 'ACTIVE' if is_patient_active else 'INACTIVE'
+#                 if patient.patient_status == 'recovered':
+#                     status_display = 'RECOVERED'
+                
+#                 patient_info = {
+#                     'patient_id': patient.patient_id,
+#                     'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
+#                     'email': patient.user.email,
+#                     'phone': patient.user.phone_number,
+#                     'status': status_display,  # ✅ From patient_status
+#                     'last_response_date': last_response_date,
+#                     'assigned_nurse': nurse_name,
+#                     'treating_doctor': doctor_name,
+#                     'gender': patient.gender,
+#                     'age': patient_age,
+#                     'blood_group': getattr(patient, 'blood_group', None),
+#                     'address': getattr(patient, 'address', None),
+#                     'health_status': health_status,
+#                     'cancer_stage': cancer_stage,
+#                     # ✅ Additional patient status details
+#                     'patient_status': patient.patient_status,  # 'active', 'inactive', 'recovered'
+#                     'status_reason': patient.status_reason,
+#                     'recovery_date': patient.recovery_date,
+#                     'recovery_notes': patient.recovery_notes,
+#                     'death_date': patient.death_date,
+#                     'death_cause': patient.death_cause,
+#                     'death_notes': patient.death_notes,
+#                     'discontinuation_date': patient.discontinuation_date,
+#                     'discontinuation_reason': patient.discontinuation_reason,
+#                     'discontinuation_notes': patient.discontinuation_notes,
+#                 }
+#                 patient_details_list.append(patient_info)
+                
+#             except Exception as e:
+#                 print(f"Error processing patient {patient.pk}: {e}")
+#                 continue
+        
+#         # ✅ Filter patients based on patient_status field
+#         active_patient_details = [p for p in patient_details_list if p['patient_status'] == 'active']
+#         inactive_patient_details = [p for p in patient_details_list if p['patient_status'] == 'inactive']
+#         recovered_patient_details = [p for p in patient_details_list if p['patient_status'] == 'recovered']
+        
+#         # ========== Recovery Rate ==========
+#         all_patient_records = PatientMedicalRecord.objects.all()
+#         total_patients_with_status = 0
+#         improving_patients = 0
+        
+#         for patient_record in all_patient_records:
+#             try:
+#                 if hasattr(patient_record, 'health_status') and patient_record.health_status:
+#                     total_patients_with_status += 1
+#                     if patient_record.health_status == 'IMPROVING':
+#                         improving_patients += 1
+#             except Exception as e:
+#                 continue
+        
+#         recovery_rate = round(
+#             (improving_patients / total_patients_with_status * 100) 
+#             if total_patients_with_status > 0 else 0, 
+#             1
+#         )
+        
+#         # ========== Patient Activity - last 7 days ==========
+#         last_7_days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+#         patient_activity = []
+#         for day in last_7_days:
+#             day_start = datetime.combine(day, datetime.min.time())
+#             day_end = datetime.combine(day, datetime.max.time())
+            
+#             count = DailyResponse.objects.filter(
+#                 response_date__gte=day_start,
+#                 response_date__lte=day_end
+#             ).count()
+            
+#             patient_activity.append({
+#                 'date': day.strftime('%Y-%m-%d'),
+#                 'count': count
+#             })
+        
+#         # ========== Questionnaire Completion Rate ==========
+#         total_questionnaires = QuestionnaireAssignment.objects.filter(
+#             created_at__gte=start_datetime,
+#             created_at__lte=today_datetime
+#         ).count()
+        
+#         completed_questionnaires = QuestionnaireAssignment.objects.filter(
+#             status='COMPLETED',
+#             created_at__gte=start_datetime,
+#             created_at__lte=today_datetime
+#         ).count()
+        
+#         completion_rate = round(
+#             (completed_questionnaires / total_questionnaires * 100) 
+#             if total_questionnaires > 0 else 0, 
+#             1
+#         )
+        
+#         # ========== Additional Stats ==========
+#         active_alerts = Alert.objects.filter(status='NEW').count()
+        
+#         # Critical patients count
+#         critical_patients = 0
+#         for record in PatientMedicalRecord.objects.all():
+#             try:
+#                 if hasattr(record, 'cancer_stage') and record.cancer_stage in ['STAGE_3', 'STAGE_4']:
+#                     critical_patients += 1
+#             except Exception as e:
+#                 continue
+        
+#         # Alert statistics by severity
+#         high_severity_alerts = Alert.objects.filter(
+#             alert_level='HIGH',
+#             status='NEW'
+#         ).count()
+        
+#         medium_severity_alerts = Alert.objects.filter(
+#             alert_level='MEDIUM',
+#             status='NEW'
+#         ).count()
+        
+#         low_severity_alerts = Alert.objects.filter(
+#             alert_level='LOW',
+#             status='NEW'
+#         ).count()
+        
+#         # ========== Gender distribution ==========
+#         male_patients = PatientProfile.objects.filter(gender='MALE').count()
+#         female_patients = PatientProfile.objects.filter(gender='FEMALE').count()
+#         other_gender_patients = PatientProfile.objects.filter(gender='OTHER').count()
+        
+#         # ========== Age group distribution ==========
+#         age_groups = {
+#             '0-18': 0,
+#             '19-30': 0,
+#             '31-50': 0,
+#             '51-70': 0,
+#             '70+': 0
+#         }
+        
+#         for patient_profile in PatientProfile.objects.all():
+#             try:
+#                 if patient_profile.date_of_birth:
+#                     age = calculate_age(patient_profile.date_of_birth)
+#                     if age:
+#                         if age <= 18:
+#                             age_groups['0-18'] += 1
+#                         elif age <= 30:
+#                             age_groups['19-30'] += 1
+#                         elif age <= 50:
+#                             age_groups['31-50'] += 1
+#                         elif age <= 70:
+#                             age_groups['51-70'] += 1
+#                         else:
+#                             age_groups['70+'] += 1
+#             except Exception as e:
+#                 continue
+        
+#         # ========== Cancer stage distribution ==========
+#         stage_1 = 0
+#         stage_2 = 0
+#         stage_3 = 0
+#         stage_4 = 0
+        
+#         for record in PatientMedicalRecord.objects.all():
+#             try:
+#                 if hasattr(record, 'cancer_stage'):
+#                     if record.cancer_stage == 'STAGE_1':
+#                         stage_1 += 1
+#                     elif record.cancer_stage == 'STAGE_2':
+#                         stage_2 += 1
+#                     elif record.cancer_stage == 'STAGE_3':
+#                         stage_3 += 1
+#                     elif record.cancer_stage == 'STAGE_4':
+#                         stage_4 += 1
+#             except Exception as e:
+#                 continue
+        
+#         # ========== Response ==========
+#         return Response({
+#             'success': True,
+#             'data': {
+#                 # Total Counts
+#                 'total_patients': total_patients,
+#                 'total_doctors': total_doctors,
+#                 'total_nurses': total_nurses,
+                
+#                 # Questionnaires
+#                 'active_questionnaires': active_questionnaires,
+#                 'reports_generated': reports_generated,
+                
+#                 # Patient Activity
+#                 'patient_activity': patient_activity,
+                
+#                 # Questionnaire Completion
+#                 'questionnaire_completion': {
+#                     'rate': completion_rate,
+#                     'total': total_questionnaires,
+#                     'completed': completed_questionnaires
+#                 },
+                
+#                 # Additional Stats
+#                 'additional_stats': {
+#                     'active_alerts': active_alerts,
+#                     'critical_patients': critical_patients
+#                 },
+                
+#                 # Recent Alerts
+#                 'recent_alerts': AlertSerializer(
+#                     Alert.objects.filter(status='NEW')[:5], 
+#                     many=True
+#                 ).data,
+                
+#                 # ✅ Patient Statistics (Based on patient_status field)
+#                 'patient_stats': {
+#                     'active_patients': active_patients,
+#                     'inactive_patients': inactive_patients,
+#                     'recovered_patients': recovered_patients,
+#                     'total_patients': total_patients,
+#                     'active_percentage': round((active_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+#                     'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+#                     'recovered_percentage': round((recovered_patients / total_patients * 100) if total_patients > 0 else 0, 1)
+#                 },
+                
+#                 # ✅ Patient Details with Active/Inactive/Recovered Status
+#                 'patient_details': {
+#                     'active': {
+#                         'count': len(active_patient_details),
+#                         'patients': active_patient_details
+#                     },
+#                     'inactive': {
+#                         'count': len(inactive_patient_details),
+#                         'patients': inactive_patient_details
+#                     },
+#                     'recovered': {
+#                         'count': len(recovered_patient_details),
+#                         'patients': recovered_patient_details
+#                     }
+#                 },
+                
+#                 # Doctor Statistics
+#                 'doctor_stats': {
+#                     'total': total_doctors,
+#                     'active': active_doctors,
+#                     'inactive': inactive_doctors,
+#                     'active_percentage': round((active_doctors / total_doctors * 100) if total_doctors > 0 else 0, 1),
+#                     'inactive_percentage': round((inactive_doctors / total_doctors * 100) if total_doctors > 0 else 0, 1)
+#                 },
+                
+#                 # Doctor Details with Active/Inactive Status
+#                 'doctor_details': {
+#                     'active': {
+#                         'count': len(active_doctor_details),
+#                         'doctors': active_doctor_details
+#                     },
+#                     'inactive': {
+#                         'count': len(inactive_doctor_details),
+#                         'doctors': inactive_doctor_details
+#                     }
+#                 },
+                
+#                 # Nurse Statistics
+#                 'nurse_stats': {
+#                     'total': total_nurses,
+#                     'active': active_nurses,
+#                     'inactive': inactive_nurses,
+#                     'active_percentage': round((active_nurses / total_nurses * 100) if total_nurses > 0 else 0, 1),
+#                     'inactive_percentage': round((inactive_nurses / total_nurses * 100) if total_nurses > 0 else 0, 1)
+#                 },
+                
+#                 # Nurse Details with Active/Inactive Status
+#                 'nurse_details': {
+#                     'active': {
+#                         'count': len(active_nurse_details),
+#                         'nurses': active_nurse_details
+#                     },
+#                     'inactive': {
+#                         'count': len(inactive_nurse_details),
+#                         'nurses': inactive_nurse_details
+#                     }
+#                 },
+                
+#                 # Question Statistics
+#                 'question_stats': {
+#                     'active_questions': active_questions,
+#                     'total_active_questionnaires': active_questionnaires
+#                 },
+                
+#                 # Recovery Statistics
+#                 'recovery_stats': {
+#                     'recovery_rate': recovery_rate,
+#                     'improving_patients': improving_patients,
+#                     'total_patients_tracked': total_patients_with_status,
+#                     'remaining_patients': total_patients_with_status - improving_patients
+#                 },
+                
+#                 # Gender Distribution
+#                 'gender_distribution': {
+#                     'male': male_patients,
+#                     'female': female_patients,
+#                     'other': other_gender_patients,
+#                     'male_percentage': round((male_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+#                     'female_percentage': round((female_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+#                     'other_percentage': round((other_gender_patients / total_patients * 100) if total_patients > 0 else 0, 1)
+#                 },
+                
+#                 # Age Distribution
+#                 'age_distribution': age_groups,
+                
+#                 # Alert Statistics
+#                 'alert_stats': {
+#                     'high_severity': high_severity_alerts,
+#                     'medium_severity': medium_severity_alerts,
+#                     'low_severity': low_severity_alerts,
+#                     'total_active': active_alerts
+#                 },
+                
+#                 # Cancer Stage Distribution
+#                 'cancer_stage_distribution': {
+#                     'stage_1': stage_1,
+#                     'stage_2': stage_2,
+#                     'stage_3': stage_3,
+#                     'stage_4': stage_4,
+#                     'early_stage': stage_1 + stage_2,
+#                     'late_stage': stage_3 + stage_4
+#                 }
+#             }
+#         })
+    
+#     elif user.user_type == 'DOCTOR':
+#         try:
+#             doctor = DoctorProfile.objects.get(user=user)
+            
+#             # Patients assigned to this doctor (from PatientMedicalRecord)
+#             patients = PatientMedicalRecord.objects.filter(
+#                 treating_doctor=doctor
+#             ).count()
+            
+#             escalated_alerts = Alert.objects.filter(
+#                 escalated_to_doctor=doctor,
+#                 status='ESCALATED'
+#             ).count()
+            
+#             # Active patients for this doctor
+#             last_7_days_ago = today - timedelta(days=7)
+#             last_7_days_start = datetime.combine(last_7_days_ago, datetime.min.time())
+#             today_datetime = datetime.combine(today, datetime.max.time())
+            
+#             recent_responses = DailyResponse.objects.filter(
+#                 response_date__gte=last_7_days_start,
+#                 response_date__lte=today_datetime
+#             )
+            
+#             active_patient_ids = set()
+#             for response in recent_responses:
+#                 try:
+#                     if response.patient and response.patient.treating_doctor == doctor:
+#                         if response.patient.patient:
+#                             active_patient_ids.add(response.patient.patient.patient_id)
+#                 except Exception as e:
+#                     continue
+            
+#             active_patients = len(active_patient_ids)
+#             inactive_patients = patients - active_patients
+            
+#             # Get detailed patient list for this doctor
+#             doctor_patients = PatientMedicalRecord.objects.filter(treating_doctor=doctor)
+#             patient_details_list = []
+            
+#             for patient_record in doctor_patients:
+#                 try:
+#                     patient = patient_record.patient
+#                     if patient:
+#                         # Check if patient is active
+#                         is_active = False
+#                         last_response_date = None
+                        
+#                         patient_responses = DailyResponse.objects.filter(
+#                             patient=patient_record,
+#                             response_date__gte=last_7_days_start,
+#                             response_date__lte=today_datetime
+#                         )
+#                         is_active = patient_responses.exists()
+                        
+#                         last_response = DailyResponse.objects.filter(
+#                             patient=patient_record
+#                         ).order_by('-response_date').first()
+#                         if last_response:
+#                             last_response_date = last_response.response_date
+                        
+#                         patient_details_list.append({
+#                             'patient_id': patient.patient_id,
+#                             'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
+#                             'email': patient.user.email,
+#                             'phone': patient.user.phone_number,
+#                             'status': 'ACTIVE' if is_active else 'INACTIVE',
+#                             'last_response_date': last_response_date,
+#                             'gender': patient.gender,
+#                             'health_status': patient_record.health_status if hasattr(patient_record, 'health_status') else None,
+#                             'cancer_stage': patient_record.cancer_stage if hasattr(patient_record, 'cancer_stage') else None
+#                         })
+#                 except Exception as e:
+#                     continue
+            
+#             active_patient_details = [p for p in patient_details_list if p['status'] == 'ACTIVE']
+#             inactive_patient_details = [p for p in patient_details_list if p['status'] == 'INACTIVE']
+            
+#             # Recovery rate for doctor's patients
+#             total_patients_with_status = 0
+#             improving_patients = 0
+            
+#             for patient_record in doctor_patients:
+#                 try:
+#                     if hasattr(patient_record, 'health_status') and patient_record.health_status:
+#                         total_patients_with_status += 1
+#                         if patient_record.health_status == 'IMPROVING':
+#                             improving_patients += 1
+#                 except Exception as e:
+#                     continue
+            
+#             recovery_rate = round(
+#                 (improving_patients / total_patients_with_status * 100) 
+#                 if total_patients_with_status > 0 else 0, 
+#                 1
+#             )
+            
+#             # Critical patients under this doctor
+#             critical_patients = 0
+#             for record in doctor_patients:
+#                 try:
+#                     if hasattr(record, 'cancer_stage') and record.cancer_stage in ['STAGE_3', 'STAGE_4']:
+#                         critical_patients += 1
+#                 except Exception as e:
+#                     continue
+            
+#             return Response({
+#                 'success': True,
+#                 'data': {
+#                     'total_patients': patients,
+#                     'escalated_alerts': escalated_alerts,
+#                     'patient_stats': {
+#                         'active_patients': active_patients,
+#                         'inactive_patients': inactive_patients,
+#                         'total_patients': patients,
+#                         'active_percentage': round((active_patients / patients * 100) if patients > 0 else 0, 1),
+#                         'inactive_percentage': round((inactive_patients / patients * 100) if patients > 0 else 0, 1)
+#                     },
+#                     'patient_details': {
+#                         'active': {
+#                             'count': len(active_patient_details),
+#                             'patients': active_patient_details
+#                         },
+#                         'inactive': {
+#                             'count': len(inactive_patient_details),
+#                             'patients': inactive_patient_details
+#                         }
+#                     },
+#                     'recovery_stats': {
+#                         'recovery_rate': recovery_rate,
+#                         'improving_patients': improving_patients,
+#                         'total_patients_tracked': total_patients_with_status,
+#                         'remaining_patients': total_patients_with_status - improving_patients
+#                     },
+#                     'critical_patients': critical_patients
+#                 }
+#             })
+            
+#         except DoctorProfile.DoesNotExist:
+#             raise APIError("Doctor profile not found", status_code=status.HTTP_404_NOT_FOUND)
+    
+#     return Response({
+#         'success': True,
+#         'data': {}
+#     })
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 @handle_errors
@@ -2277,7 +3277,7 @@ def get_dashboard_stats(request):
         try:
             nurse = NurseProfile.objects.get(user=user)
             
-            # Patients assigned to this nurse (from PatientMedicalRecord)
+            # Patients assigned to this nurse
             total_patients = PatientMedicalRecord.objects.filter(
                 assigned_nurse=nurse
             ).count()
@@ -2286,17 +3286,6 @@ def get_dashboard_stats(request):
             new_alerts = Alert.objects.filter(
                 assigned_to_nurse=nurse,
                 status='NEW'
-            ).count()
-            
-            # Today responses
-            today_responses = DailyResponse.objects.filter(
-                response_date__gte=start_of_month,
-                response_date__lte=today
-            ).count()
-            
-            # Pending questionnaires
-            pending_questionnaires = QuestionnaireAssignment.objects.filter(
-                status='PENDING'
             ).count()
             
             # Active patients for this nurse (submitted response in last 7 days)
@@ -2320,101 +3309,60 @@ def get_dashboard_stats(request):
             active_patients = len(active_patient_ids)
             inactive_patients = total_patients - active_patients
             
-            # Get detailed patient list for this nurse
-            nurse_patients = PatientMedicalRecord.objects.filter(assigned_nurse=nurse)
-            patient_details_list = []
-            
-            for patient_record in nurse_patients:
+            # Critical patients count
+            critical_patients = 0
+            for record in PatientMedicalRecord.objects.filter(assigned_nurse=nurse):
                 try:
-                    patient = patient_record.patient
-                    if patient:
-                        # Check if patient is active
-                        is_active = False
-                        last_response_date = None
-                        
-                        patient_responses = DailyResponse.objects.filter(
-                            patient=patient_record,
-                            response_date__gte=last_7_days_start,
-                            response_date__lte=today_datetime
-                        )
-                        is_active = patient_responses.exists()
-                        
-                        last_response = DailyResponse.objects.filter(
-                            patient=patient_record
-                        ).order_by('-response_date').first()
-                        if last_response:
-                            last_response_date = last_response.response_date
-                        
-                        patient_details_list.append({
-                            'patient_id': patient.patient_id,
-                            'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
-                            'email': patient.user.email,
-                            'phone': patient.user.phone_number,
-                            'status': 'ACTIVE' if is_active else 'INACTIVE',
-                            'last_response_date': last_response_date,
-                            'gender': patient.gender,
-                            'health_status': patient_record.health_status if hasattr(patient_record, 'health_status') else None,
-                            'cancer_stage': patient_record.cancer_stage if hasattr(patient_record, 'cancer_stage') else None
-                        })
+                    if hasattr(record, 'cancer_stage') and record.cancer_stage in ['STAGE_3', 'STAGE_4']:
+                        critical_patients += 1
                 except Exception as e:
                     continue
-            
-            active_patient_details = [p for p in patient_details_list if p['status'] == 'ACTIVE']
-            inactive_patient_details = [p for p in patient_details_list if p['status'] == 'INACTIVE']
-            
-            # Recovery rate for nurse's patients
-            total_patients_with_status = 0
-            improving_patients = 0
-            
-            for patient in nurse_patients:
-                try:
-                    if hasattr(patient, 'health_status') and patient.health_status:
-                        total_patients_with_status += 1
-                        if patient.health_status == 'IMPROVING':
-                            improving_patients += 1
-                except Exception as e:
-                    continue
-            
-            recovery_rate = round(
-                (improving_patients / total_patients_with_status * 100) 
-                if total_patients_with_status > 0 else 0, 
-                1
-            )
             
             return Response({
                 'success': True,
                 'data': {
                     'total_patients': total_patients,
-                    'new_alerts': new_alerts,
-                    'today_responses': today_responses,
-                    'pending_questionnaires': pending_questionnaires,
+                    'total_doctors': 0,
+                    'total_nurses': 0,
+                    'active_questionnaires': 0,
+                    'reports_generated': 0,
+                    'additional_stats': {
+                        'active_alerts': new_alerts,
+                        'critical_patients': critical_patients
+                    },
                     'patient_stats': {
                         'active_patients': active_patients,
                         'inactive_patients': inactive_patients,
+                        'recovered_patients': 0,
                         'total_patients': total_patients,
                         'active_percentage': round((active_patients / total_patients * 100) if total_patients > 0 else 0, 1),
-                        'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1)
+                        'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+                        'recovered_percentage': 0.0
                     },
-                    'patient_details': {
-                        'active': {
-                            'count': len(active_patient_details),
-                            'patients': active_patient_details
-                        },
-                        'inactive': {
-                            'count': len(inactive_patient_details),
-                            'patients': inactive_patient_details
-                        }
+                    'doctor_stats': {
+                        'total': 0,
+                        'active': 0,
+                        'inactive': 0,
+                        'active_percentage': 0.0,
+                        'inactive_percentage': 0.0
                     },
-                    'recovery_stats': {
-                        'recovery_rate': recovery_rate,
-                        'improving_patients': improving_patients,
-                        'total_patients_tracked': total_patients_with_status,
-                        'remaining_patients': total_patients_with_status - improving_patients
+                    'nurse_stats': {
+                        'total': 0,
+                        'active': 0,
+                        'inactive': 0,
+                        'active_percentage': 0.0,
+                        'inactive_percentage': 0.0
                     },
-                    'recent_alerts': AlertSerializer(
-                        Alert.objects.filter(assigned_to_nurse=nurse)[:5], 
-                        many=True
-                    ).data
+                    'question_stats': {
+                        'active_questions': 0,
+                        'total_active_questionnaires': 0
+                    },
+                    'alert_stats': {
+                        'high_severity': Alert.objects.filter(alert_level='HIGH', assigned_to_nurse=nurse, status='NEW').count(),
+                        'medium_severity': Alert.objects.filter(alert_level='MEDIUM', assigned_to_nurse=nurse, status='NEW').count(),
+                        'low_severity': Alert.objects.filter(alert_level='LOW', assigned_to_nurse=nurse, status='NEW').count(),
+                        'total_active': new_alerts
+                    }
                 }
             })
             
@@ -2422,13 +3370,29 @@ def get_dashboard_stats(request):
             raise APIError("Nurse profile not found", status_code=status.HTTP_404_NOT_FOUND)
     
     elif user.user_type == 'ADMIN':
-        # Admin Dashboard
-        # ========== Total Counts from Profile Models ==========
+        # Admin Dashboard - Simplified Version
+        
+        # ========== Total Counts ==========
         total_patients = PatientProfile.objects.count()
         total_doctors = DoctorProfile.objects.count()
         total_nurses = NurseProfile.objects.count()
         
-        # ========== Active Patients (submitted response in last 7 days) ==========
+        # ========== Patient Status ==========
+        active_patients = PatientProfile.objects.filter(patient_status='active').count()
+        inactive_patients = PatientProfile.objects.filter(patient_status='inactive').count()
+        recovered_patients = PatientProfile.objects.filter(patient_status='recovered').count()
+        
+        # ========== Active Questionnaires ==========
+        active_questionnaires = QuestionnaireAssignment.objects.filter(
+            status='IN_PROGRESS'
+        ).count()
+        
+        # ========== Reports Generated ==========
+        reports_generated = QuestionnaireAssignment.objects.filter(
+            status='COMPLETED'
+        ).count()
+        
+        # ========== Active Questions ==========
         last_7_days_ago = today - timedelta(days=7)
         last_7_days_start = datetime.combine(last_7_days_ago, datetime.min.time())
         
@@ -2437,18 +3401,6 @@ def get_dashboard_stats(request):
             response_date__lte=today_datetime
         )
         
-        active_patient_ids = set()
-        for response in recent_responses:
-            try:
-                if response.patient and response.patient.patient:
-                    active_patient_ids.add(response.patient.patient.patient_id)
-            except Exception as e:
-                continue
-        
-        active_patients = len(active_patient_ids)
-        inactive_patients = total_patients - active_patients
-        
-        # ========== Active Questions ==========
         active_question_ids = set()
         for response in recent_responses:
             try:
@@ -2461,282 +3413,28 @@ def get_dashboard_stats(request):
         
         active_questions = len(active_question_ids)
         
-        # ========== Active Questionnaires ==========
-        active_questionnaires = QuestionnaireAssignment.objects.filter(
-            status='IN_PROGRESS'
-        ).count()
-        
-        # ========== Reports Generated ==========
-        reports_generated = QuestionnaireAssignment.objects.filter(
-            status='COMPLETED'
-        ).count()
-        
-        # ========== Staff Statistics (Manual count for Djongo compatibility) ==========
-        # Active Doctors - Manual count
+        # ========== Staff Statistics ==========
+        # Active Doctors
         active_doctors = 0
         for doctor in DoctorProfile.objects.all():
             try:
-                is_active = getattr(doctor, 'is_active', True)
-                if is_active:
+                if getattr(doctor, 'is_active', True):
                     active_doctors += 1
-            except Exception as e:
+            except Exception:
                 active_doctors += 1
         inactive_doctors = total_doctors - active_doctors
         
-        # Active Nurses - Manual count
+        # Active Nurses
         active_nurses = 0
         for nurse in NurseProfile.objects.all():
             try:
-                is_active = getattr(nurse, 'is_active', True)
-                if is_active:
+                if getattr(nurse, 'is_active', True):
                     active_nurses += 1
-            except Exception as e:
+            except Exception:
                 active_nurses += 1
         inactive_nurses = total_nurses - active_nurses
         
-        # ========== Doctor Details with Active/Inactive Status ==========
-        doctor_details_list = []
-        for doctor in DoctorProfile.objects.all():
-            try:
-                # Check if doctor is active based on is_active field
-                is_doctor_active = getattr(doctor, 'is_active', True)
-                
-                # Get patient count for this doctor
-                patient_count = PatientMedicalRecord.objects.filter(treating_doctor=doctor).count()
-                
-                # Get assigned patients list (remove duplicates)
-                assigned_patients = []
-                seen_patients = set()
-                patient_records = PatientMedicalRecord.objects.filter(treating_doctor=doctor)
-                for pr in patient_records:
-                    if pr.patient and pr.patient.patient_id not in seen_patients:
-                        seen_patients.add(pr.patient.patient_id)
-                        assigned_patients.append({
-                            'patient_id': pr.patient.patient_id,
-                            'name': f"{pr.patient.first_name} {pr.patient.last_name}".strip() or pr.patient.user.username
-                        })
-                
-                # Get name from doctor fields
-                doctor_name = ""
-                if hasattr(doctor, 'first_name') and doctor.first_name:
-                    doctor_name = f"{doctor.first_name} {doctor.last_name}".strip()
-                else:
-                    doctor_name = f"{doctor.user.first_name} {doctor.user.last_name}".strip() or doctor.user.username
-                
-                doctor_details_list.append({
-                    'doctor_id': doctor.pk,
-                    'name': doctor_name,
-                    'email': getattr(doctor, 'email', None) or doctor.user.email,
-                    'phone': getattr(doctor, 'phone_number', None) or doctor.user.phone_number,
-                    'specialization': getattr(doctor, 'specialization', None),
-                    'status': 'ACTIVE' if is_doctor_active else 'INACTIVE',
-                    'patient_count': patient_count,
-                    'assigned_patients': assigned_patients[:10]
-                })
-            except Exception as e:
-                print(f"Error processing doctor {doctor.pk}: {e}")
-                continue
-        
-        active_doctor_details = [d for d in doctor_details_list if d['status'] == 'ACTIVE']
-        inactive_doctor_details = [d for d in doctor_details_list if d['status'] == 'INACTIVE']
-        
-        # ========== Nurse Details with Active/Inactive Status ==========
-        nurse_details_list = []
-        for nurse in NurseProfile.objects.all():
-            try:
-                # Check if nurse is active based on is_active field
-                is_nurse_active = getattr(nurse, 'is_active', True)
-                
-                # Get patient count for this nurse
-                patient_count = PatientMedicalRecord.objects.filter(assigned_nurse=nurse).count()
-                
-                # Get assigned patients list (remove duplicates)
-                assigned_patients = []
-                seen_patients = set()
-                patient_records = PatientMedicalRecord.objects.filter(assigned_nurse=nurse)
-                for pr in patient_records:
-                    if pr.patient and pr.patient.patient_id not in seen_patients:
-                        seen_patients.add(pr.patient.patient_id)
-                        assigned_patients.append({
-                            'patient_id': pr.patient.patient_id,
-                            'name': f"{pr.patient.first_name} {pr.patient.last_name}".strip() or pr.patient.user.username
-                        })
-                
-                # Get name from nurse fields
-                nurse_name = ""
-                if hasattr(nurse, 'first_name') and nurse.first_name:
-                    nurse_name = f"{nurse.first_name} {nurse.last_name}".strip()
-                else:
-                    nurse_name = f"{nurse.user.first_name} {nurse.user.last_name}".strip() or nurse.user.username
-                
-                nurse_details_list.append({
-                    'nurse_id': nurse.pk,
-                    'name': nurse_name,
-                    'email': getattr(nurse, 'email', None) or nurse.user.email,
-                    'phone': getattr(nurse, 'phone_number', None) or nurse.user.phone_number,
-                    'status': 'ACTIVE' if is_nurse_active else 'INACTIVE',
-                    'patient_count': patient_count,
-                    'assigned_patients': assigned_patients[:10]
-                })
-            except Exception as e:
-                print(f"Error processing nurse {nurse.pk}: {e}")
-                continue
-        
-        active_nurse_details = [n for n in nurse_details_list if n['status'] == 'ACTIVE']
-        inactive_nurse_details = [n for n in nurse_details_list if n['status'] == 'INACTIVE']
-        
-        # ========== Patient Details with Active/Inactive Status ==========
-        from datetime import date as date_module
-        
-        def calculate_age(birth_date):
-            if birth_date:
-                today_date = date_module.today()
-                return today_date.year - birth_date.year - (
-                    (today_date.month, today_date.day) < (birth_date.month, birth_date.day)
-                )
-            return None
-        
-        patient_details_list = []
-        for patient in PatientProfile.objects.all():
-            try:
-                # Get patient medical record
-                medical_record = PatientMedicalRecord.objects.filter(patient=patient).first()
-                
-                # Check if patient has any response in last 7 days
-                has_recent_response = False
-                last_response_date = None
-                
-                if medical_record:
-                    # Check for responses in last 7 days
-                    recent_patient_responses = DailyResponse.objects.filter(
-                        patient=medical_record,
-                        response_date__gte=last_7_days_start,
-                        response_date__lte=today_datetime
-                    )
-                    has_recent_response = recent_patient_responses.exists()
-                    
-                    # Get last response date
-                    last_response = DailyResponse.objects.filter(
-                        patient=medical_record
-                    ).order_by('-response_date').first()
-                    if last_response:
-                        last_response_date = last_response.response_date
-                
-                # Get nurse and doctor names
-                nurse_name = None
-                doctor_name = None
-                if medical_record:
-                    if medical_record.assigned_nurse:
-                        nurse = medical_record.assigned_nurse
-                        if hasattr(nurse, 'first_name') and nurse.first_name:
-                            nurse_name = f"{nurse.first_name} {nurse.last_name}".strip()
-                        else:
-                            nurse_name = f"{nurse.user.first_name} {nurse.user.last_name}".strip() or nurse.user.username
-                    if medical_record.treating_doctor:
-                        doctor = medical_record.treating_doctor
-                        if hasattr(doctor, 'first_name') and doctor.first_name:
-                            doctor_name = f"{doctor.first_name} {doctor.last_name}".strip()
-                        else:
-                            doctor_name = f"{doctor.user.first_name} {doctor.user.last_name}".strip() or doctor.user.username
-                
-                # Calculate age
-                patient_age = None
-                if patient.date_of_birth:
-                    patient_age = calculate_age(patient.date_of_birth)
-                
-                # Get health status and cancer stage safely
-                health_status = None
-                cancer_stage = None
-                if medical_record:
-                    if hasattr(medical_record, 'health_status'):
-                        health_status = medical_record.health_status
-                    if hasattr(medical_record, 'cancer_stage'):
-                        cancer_stage = medical_record.cancer_stage
-                
-                patient_info = {
-                    'patient_id': patient.patient_id,
-                    'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
-                    'email': patient.user.email,
-                    'phone': patient.user.phone_number,
-                    'status': 'ACTIVE' if has_recent_response else 'INACTIVE',
-                    'last_response_date': last_response_date,
-                    'assigned_nurse': nurse_name,
-                    'treating_doctor': doctor_name,
-                    'gender': patient.gender,
-                    'age': patient_age,
-                    'blood_group': getattr(patient, 'blood_group', None),
-                    'address': getattr(patient, 'address', None),
-                    'health_status': health_status,
-                    'cancer_stage': cancer_stage
-                }
-                patient_details_list.append(patient_info)
-                
-            except Exception as e:
-                print(f"Error processing patient {patient.pk}: {e}")
-                continue
-        
-        active_patient_details = [p for p in patient_details_list if p['status'] == 'ACTIVE']
-        inactive_patient_details = [p for p in patient_details_list if p['status'] == 'INACTIVE']
-        
-        # ========== Recovery Rate ==========
-        all_patient_records = PatientMedicalRecord.objects.all()
-        total_patients_with_status = 0
-        improving_patients = 0
-        
-        for patient_record in all_patient_records:
-            try:
-                if hasattr(patient_record, 'health_status') and patient_record.health_status:
-                    total_patients_with_status += 1
-                    if patient_record.health_status == 'IMPROVING':
-                        improving_patients += 1
-            except Exception as e:
-                continue
-        
-        recovery_rate = round(
-            (improving_patients / total_patients_with_status * 100) 
-            if total_patients_with_status > 0 else 0, 
-            1
-        )
-        
-        # ========== Patient Activity - last 7 days ==========
-        last_7_days = [today - timedelta(days=i) for i in range(6, -1, -1)]
-        patient_activity = []
-        for day in last_7_days:
-            day_start = datetime.combine(day, datetime.min.time())
-            day_end = datetime.combine(day, datetime.max.time())
-            
-            count = DailyResponse.objects.filter(
-                response_date__gte=day_start,
-                response_date__lte=day_end
-            ).count()
-            
-            patient_activity.append({
-                'date': day.strftime('%Y-%m-%d'),
-                'count': count
-            })
-        
-        # ========== Questionnaire Completion Rate ==========
-        total_questionnaires = QuestionnaireAssignment.objects.filter(
-            created_at__gte=start_datetime,
-            created_at__lte=today_datetime
-        ).count()
-        
-        completed_questionnaires = QuestionnaireAssignment.objects.filter(
-            status='COMPLETED',
-            created_at__gte=start_datetime,
-            created_at__lte=today_datetime
-        ).count()
-        
-        completion_rate = round(
-            (completed_questionnaires / total_questionnaires * 100) 
-            if total_questionnaires > 0 else 0, 
-            1
-        )
-        
-        # ========== Additional Stats ==========
-        active_alerts = Alert.objects.filter(status='NEW').count()
-        
-        # Critical patients count
+        # ========== Critical Patients ==========
         critical_patients = 0
         for record in PatientMedicalRecord.objects.all():
             try:
@@ -2745,131 +3443,34 @@ def get_dashboard_stats(request):
             except Exception as e:
                 continue
         
-        # Alert statistics by severity
-        high_severity_alerts = Alert.objects.filter(
-            alert_level='HIGH',
-            status='NEW'
-        ).count()
+        # ========== Alert Statistics ==========
+        active_alerts = Alert.objects.filter(status='NEW').count()
+        high_severity_alerts = Alert.objects.filter(alert_level='HIGH', status='NEW').count()
+        medium_severity_alerts = Alert.objects.filter(alert_level='MEDIUM', status='NEW').count()
+        low_severity_alerts = Alert.objects.filter(alert_level='LOW', status='NEW').count()
         
-        medium_severity_alerts = Alert.objects.filter(
-            alert_level='MEDIUM',
-            status='NEW'
-        ).count()
-        
-        low_severity_alerts = Alert.objects.filter(
-            alert_level='LOW',
-            status='NEW'
-        ).count()
-        
-        # ========== Gender distribution ==========
-        male_patients = PatientProfile.objects.filter(gender='MALE').count()
-        female_patients = PatientProfile.objects.filter(gender='FEMALE').count()
-        other_gender_patients = PatientProfile.objects.filter(gender='OTHER').count()
-        
-        # ========== Age group distribution ==========
-        age_groups = {
-            '0-18': 0,
-            '19-30': 0,
-            '31-50': 0,
-            '51-70': 0,
-            '70+': 0
-        }
-        
-        for patient_profile in PatientProfile.objects.all():
-            try:
-                if patient_profile.date_of_birth:
-                    age = calculate_age(patient_profile.date_of_birth)
-                    if age:
-                        if age <= 18:
-                            age_groups['0-18'] += 1
-                        elif age <= 30:
-                            age_groups['19-30'] += 1
-                        elif age <= 50:
-                            age_groups['31-50'] += 1
-                        elif age <= 70:
-                            age_groups['51-70'] += 1
-                        else:
-                            age_groups['70+'] += 1
-            except Exception as e:
-                continue
-        
-        # ========== Cancer stage distribution ==========
-        stage_1 = 0
-        stage_2 = 0
-        stage_3 = 0
-        stage_4 = 0
-        
-        for record in PatientMedicalRecord.objects.all():
-            try:
-                if hasattr(record, 'cancer_stage'):
-                    if record.cancer_stage == 'STAGE_1':
-                        stage_1 += 1
-                    elif record.cancer_stage == 'STAGE_2':
-                        stage_2 += 1
-                    elif record.cancer_stage == 'STAGE_3':
-                        stage_3 += 1
-                    elif record.cancer_stage == 'STAGE_4':
-                        stage_4 += 1
-            except Exception as e:
-                continue
-        
-        # ========== Response ==========
+        # ========== Return Simplified Response ==========
         return Response({
             'success': True,
             'data': {
-                # Total Counts
                 'total_patients': total_patients,
                 'total_doctors': total_doctors,
                 'total_nurses': total_nurses,
-                
-                # Questionnaires
                 'active_questionnaires': active_questionnaires,
                 'reports_generated': reports_generated,
-                
-                # Patient Activity
-                'patient_activity': patient_activity,
-                
-                # Questionnaire Completion
-                'questionnaire_completion': {
-                    'rate': completion_rate,
-                    'total': total_questionnaires,
-                    'completed': completed_questionnaires
-                },
-                
-                # Additional Stats
                 'additional_stats': {
                     'active_alerts': active_alerts,
                     'critical_patients': critical_patients
                 },
-                
-                # Recent Alerts
-                'recent_alerts': AlertSerializer(
-                    Alert.objects.filter(status='NEW')[:5], 
-                    many=True
-                ).data,
-                
-                # Patient Statistics (Overall)
                 'patient_stats': {
                     'active_patients': active_patients,
                     'inactive_patients': inactive_patients,
+                    'recovered_patients': recovered_patients,
                     'total_patients': total_patients,
                     'active_percentage': round((active_patients / total_patients * 100) if total_patients > 0 else 0, 1),
-                    'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1)
+                    'inactive_percentage': round((inactive_patients / total_patients * 100) if total_patients > 0 else 0, 1),
+                    'recovered_percentage': round((recovered_patients / total_patients * 100) if total_patients > 0 else 0, 1)
                 },
-                
-                # Patient Details with Active/Inactive Status
-                'patient_details': {
-                    'active': {
-                        'count': len(active_patient_details),
-                        'patients': active_patient_details
-                    },
-                    'inactive': {
-                        'count': len(inactive_patient_details),
-                        'patients': inactive_patient_details
-                    }
-                },
-                
-                # Doctor Statistics
                 'doctor_stats': {
                     'total': total_doctors,
                     'active': active_doctors,
@@ -2877,20 +3478,6 @@ def get_dashboard_stats(request):
                     'active_percentage': round((active_doctors / total_doctors * 100) if total_doctors > 0 else 0, 1),
                     'inactive_percentage': round((inactive_doctors / total_doctors * 100) if total_doctors > 0 else 0, 1)
                 },
-                
-                # Doctor Details with Active/Inactive Status
-                'doctor_details': {
-                    'active': {
-                        'count': len(active_doctor_details),
-                        'doctors': active_doctor_details
-                    },
-                    'inactive': {
-                        'count': len(inactive_doctor_details),
-                        'doctors': inactive_doctor_details
-                    }
-                },
-                
-                # Nurse Statistics
                 'nurse_stats': {
                     'total': total_nurses,
                     'active': active_nurses,
@@ -2898,62 +3485,15 @@ def get_dashboard_stats(request):
                     'active_percentage': round((active_nurses / total_nurses * 100) if total_nurses > 0 else 0, 1),
                     'inactive_percentage': round((inactive_nurses / total_nurses * 100) if total_nurses > 0 else 0, 1)
                 },
-                
-                # Nurse Details with Active/Inactive Status
-                'nurse_details': {
-                    'active': {
-                        'count': len(active_nurse_details),
-                        'nurses': active_nurse_details
-                    },
-                    'inactive': {
-                        'count': len(inactive_nurse_details),
-                        'nurses': inactive_nurse_details
-                    }
-                },
-                
-                # Question Statistics
                 'question_stats': {
                     'active_questions': active_questions,
                     'total_active_questionnaires': active_questionnaires
                 },
-                
-                # Recovery Statistics
-                'recovery_stats': {
-                    'recovery_rate': recovery_rate,
-                    'improving_patients': improving_patients,
-                    'total_patients_tracked': total_patients_with_status,
-                    'remaining_patients': total_patients_with_status - improving_patients
-                },
-                
-                # Gender Distribution
-                'gender_distribution': {
-                    'male': male_patients,
-                    'female': female_patients,
-                    'other': other_gender_patients,
-                    'male_percentage': round((male_patients / total_patients * 100) if total_patients > 0 else 0, 1),
-                    'female_percentage': round((female_patients / total_patients * 100) if total_patients > 0 else 0, 1),
-                    'other_percentage': round((other_gender_patients / total_patients * 100) if total_patients > 0 else 0, 1)
-                },
-                
-                # Age Distribution
-                'age_distribution': age_groups,
-                
-                # Alert Statistics
                 'alert_stats': {
                     'high_severity': high_severity_alerts,
                     'medium_severity': medium_severity_alerts,
                     'low_severity': low_severity_alerts,
                     'total_active': active_alerts
-                },
-                
-                # Cancer Stage Distribution
-                'cancer_stage_distribution': {
-                    'stage_1': stage_1,
-                    'stage_2': stage_2,
-                    'stage_3': stage_3,
-                    'stage_4': stage_4,
-                    'early_stage': stage_1 + stage_2,
-                    'late_stage': stage_3 + stage_4
                 }
             }
         })
@@ -2962,7 +3502,7 @@ def get_dashboard_stats(request):
         try:
             doctor = DoctorProfile.objects.get(user=user)
             
-            # Patients assigned to this doctor (from PatientMedicalRecord)
+            # Patients assigned to this doctor
             patients = PatientMedicalRecord.objects.filter(
                 treating_doctor=doctor
             ).count()
@@ -2975,7 +3515,6 @@ def get_dashboard_stats(request):
             # Active patients for this doctor
             last_7_days_ago = today - timedelta(days=7)
             last_7_days_start = datetime.combine(last_7_days_ago, datetime.min.time())
-            today_datetime = datetime.combine(today, datetime.max.time())
             
             recent_responses = DailyResponse.objects.filter(
                 response_date__gte=last_7_days_start,
@@ -2994,70 +3533,9 @@ def get_dashboard_stats(request):
             active_patients = len(active_patient_ids)
             inactive_patients = patients - active_patients
             
-            # Get detailed patient list for this doctor
-            doctor_patients = PatientMedicalRecord.objects.filter(treating_doctor=doctor)
-            patient_details_list = []
-            
-            for patient_record in doctor_patients:
-                try:
-                    patient = patient_record.patient
-                    if patient:
-                        # Check if patient is active
-                        is_active = False
-                        last_response_date = None
-                        
-                        patient_responses = DailyResponse.objects.filter(
-                            patient=patient_record,
-                            response_date__gte=last_7_days_start,
-                            response_date__lte=today_datetime
-                        )
-                        is_active = patient_responses.exists()
-                        
-                        last_response = DailyResponse.objects.filter(
-                            patient=patient_record
-                        ).order_by('-response_date').first()
-                        if last_response:
-                            last_response_date = last_response.response_date
-                        
-                        patient_details_list.append({
-                            'patient_id': patient.patient_id,
-                            'name': f"{patient.first_name} {patient.last_name}".strip() or patient.user.username,
-                            'email': patient.user.email,
-                            'phone': patient.user.phone_number,
-                            'status': 'ACTIVE' if is_active else 'INACTIVE',
-                            'last_response_date': last_response_date,
-                            'gender': patient.gender,
-                            'health_status': patient_record.health_status if hasattr(patient_record, 'health_status') else None,
-                            'cancer_stage': patient_record.cancer_stage if hasattr(patient_record, 'cancer_stage') else None
-                        })
-                except Exception as e:
-                    continue
-            
-            active_patient_details = [p for p in patient_details_list if p['status'] == 'ACTIVE']
-            inactive_patient_details = [p for p in patient_details_list if p['status'] == 'INACTIVE']
-            
-            # Recovery rate for doctor's patients
-            total_patients_with_status = 0
-            improving_patients = 0
-            
-            for patient_record in doctor_patients:
-                try:
-                    if hasattr(patient_record, 'health_status') and patient_record.health_status:
-                        total_patients_with_status += 1
-                        if patient_record.health_status == 'IMPROVING':
-                            improving_patients += 1
-                except Exception as e:
-                    continue
-            
-            recovery_rate = round(
-                (improving_patients / total_patients_with_status * 100) 
-                if total_patients_with_status > 0 else 0, 
-                1
-            )
-            
-            # Critical patients under this doctor
+            # Critical patients count
             critical_patients = 0
-            for record in doctor_patients:
+            for record in PatientMedicalRecord.objects.filter(treating_doctor=doctor):
                 try:
                     if hasattr(record, 'cancer_stage') and record.cancer_stage in ['STAGE_3', 'STAGE_4']:
                         critical_patients += 1
@@ -3068,31 +3546,47 @@ def get_dashboard_stats(request):
                 'success': True,
                 'data': {
                     'total_patients': patients,
-                    'escalated_alerts': escalated_alerts,
+                    'total_doctors': 0,
+                    'total_nurses': 0,
+                    'active_questionnaires': 0,
+                    'reports_generated': 0,
+                    'additional_stats': {
+                        'active_alerts': escalated_alerts,
+                        'critical_patients': critical_patients
+                    },
                     'patient_stats': {
                         'active_patients': active_patients,
                         'inactive_patients': inactive_patients,
+                        'recovered_patients': 0,
                         'total_patients': patients,
                         'active_percentage': round((active_patients / patients * 100) if patients > 0 else 0, 1),
-                        'inactive_percentage': round((inactive_patients / patients * 100) if patients > 0 else 0, 1)
+                        'inactive_percentage': round((inactive_patients / patients * 100) if patients > 0 else 0, 1),
+                        'recovered_percentage': 0.0
                     },
-                    'patient_details': {
-                        'active': {
-                            'count': len(active_patient_details),
-                            'patients': active_patient_details
-                        },
-                        'inactive': {
-                            'count': len(inactive_patient_details),
-                            'patients': inactive_patient_details
-                        }
+                    'doctor_stats': {
+                        'total': 0,
+                        'active': 0,
+                        'inactive': 0,
+                        'active_percentage': 0.0,
+                        'inactive_percentage': 0.0
                     },
-                    'recovery_stats': {
-                        'recovery_rate': recovery_rate,
-                        'improving_patients': improving_patients,
-                        'total_patients_tracked': total_patients_with_status,
-                        'remaining_patients': total_patients_with_status - improving_patients
+                    'nurse_stats': {
+                        'total': 0,
+                        'active': 0,
+                        'inactive': 0,
+                        'active_percentage': 0.0,
+                        'inactive_percentage': 0.0
                     },
-                    'critical_patients': critical_patients
+                    'question_stats': {
+                        'active_questions': 0,
+                        'total_active_questionnaires': 0
+                    },
+                    'alert_stats': {
+                        'high_severity': Alert.objects.filter(alert_level='HIGH', escalated_to_doctor=doctor, status='ESCALATED').count(),
+                        'medium_severity': Alert.objects.filter(alert_level='MEDIUM', escalated_to_doctor=doctor, status='ESCALATED').count(),
+                        'low_severity': Alert.objects.filter(alert_level='LOW', escalated_to_doctor=doctor, status='ESCALATED').count(),
+                        'total_active': escalated_alerts
+                    }
                 }
             })
             
